@@ -1,1 +1,55 @@
+
+# folder ignore
 Code Example/
+
+# --- ENVIRONMENTS ---
+venv/
+.env/
+*.env
+.ipynb_checkpoints/
+
+# --- IDEs / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- PYTHON ARTIFACTS ---
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+
+# --- MODEL FILES ---
+*.ckpt
+*.safetensors
+*.pt
+*.npy
+*.png
+*.pth
+*.onnx
+checkpoints/
+models/
+weights/
+huggingface/
+~/.cache/
+
+# --- GENERATED CONTENT ---
+TrainingData/image/
+TrainingData/latents/
+Code Example/
+
+# --- LOGS / TEMP ---
+logs/
+*.log
+*.tmp
+*.bak
+*.swp
+
+# --- SECRETS ---
+config.json
+config.yaml
+*.key
+*.pem
+posthoc-generative-cbm/
