@@ -8,10 +8,14 @@ from torch.autograd import Function
 # ==========================================
 
 def _weights_init(m):
-    """Initialize weights for linear layers."""
+    """Initialize weights for linear and convolutional layers."""
     classname = m.__class__.__name__
     if 'Linear' in classname:
         nn.init.xavier_uniform_(m.weight.data)
+        if m.bias is not None:
+            nn.init.constant_(m.bias.data, 0.)
+    elif 'Conv' in classname:
+        nn.init.kaiming_normal_(m.weight.data, mode='fan_out', nonlinearity='leaky_relu')
         if m.bias is not None:
             nn.init.constant_(m.bias.data, 0.)
     elif 'BatchNorm' in classname:
@@ -37,21 +41,27 @@ class GradientReversal(nn.Module):
         return GradientReversalFn.apply(x, self.alpha)
 
 # ==========================================
-# 2. Base Concept Bottleneck Autoencoder
+# 2. Stream Implementations (Text & Image)
 # ==========================================
 
-class CB_AE_Base(nn.Module):
+class Text_CB_AE(nn.Module):
     """
-    Base Concept Bottleneck Autoencoder.
+    Specialized for Text Stream (C_ctxt).
+    Uses Mean Pooling to compress the sequence into a semantic vector
+    before bottlenecking, enforcing global semantic constraints.
     
     Modes:
     - use_adversarial=True  -> Soft Bottleneck (Concepts + Residual Stream).
                                Includes Gradient Reversal to purge concepts from residual.
     - use_adversarial=False -> Hard Bottleneck (Concepts Only).
                                Residual stream is removed entirely.
+    
+    Default dimensions match SD3.5 Medium: seq_len=333, embed_dim=1536
     """
-    def __init__(self, input_dim, concept_dim, hidden_dim=4096, use_adversarial=False):
+    def __init__(self, seq_len=333, embed_dim=1536, concept_dim=2, hidden_dim=4096, use_adversarial=False):
         super().__init__()
+        self.seq_len = seq_len
+        self.embed_dim = embed_dim
         self.use_adversarial = use_adversarial
         
         # LOGIC: If no adversarial training, we force a Hard Bottleneck (0 residual).
@@ -65,8 +75,9 @@ class CB_AE_Base(nn.Module):
         self.total_bottleneck = concept_dim + self.unsupervised_dim
         
         # --- Encoder ---
+        # Input is the pooled embedding (embed_dim), not the full sequence
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(embed_dim, hidden_dim),
             nn.LeakyReLU(0.1),
             nn.BatchNorm1d(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim), # Added depth for complex SD3 signals
@@ -83,7 +94,7 @@ class CB_AE_Base(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(0.1),
             nn.BatchNorm1d(hidden_dim),
-            nn.Linear(hidden_dim, input_dim)
+            nn.Linear(hidden_dim, embed_dim)
         )
 
         # --- Adversarial Branch (Only for Soft Bottleneck) ---
@@ -99,17 +110,27 @@ class CB_AE_Base(nn.Module):
         self.apply(_weights_init)
 
     def forward(self, x):
-        # Flatten input (Batch, Seq, Dim) -> (Batch, Seq*Dim) if needed
-        original_shape = x.shape
-        if x.dim() > 2:
-            x_flat = x.view(x.size(0), -1)
-        else:
-            x_flat = x
-            
-        # 1. Encode -> Latent z
-        z = self.encoder(x_flat)
+        """
+        Forward pass for text embeddings.
         
-        # 2. Split Concepts (c) and Residual (u)
+        Args:
+            x: Text embeddings, shape (Batch, seq_len, embed_dim)
+               e.g., (Batch, 333, 1536) for SD3.5 Medium
+        
+        Returns:
+            recon: Reconstructed embeddings, shape (Batch, seq_len, embed_dim)
+            c: Concept logits, shape (Batch, concept_dim)
+            adv_logits: (Optional) Adversarial logits if use_adversarial=True
+        """
+        # x shape: (Batch, seq_len, embed_dim) e.g., (Batch, 333, 1536) for SD3.5 Medium
+        
+        # 1. POOLING: Compress sequence to get global semantics
+        x_pooled = x.mean(dim=1) # (Batch, embed_dim)
+        
+        # 2. Encode -> Latent z
+        z = self.encoder(x_pooled)
+        
+        # 3. Split Concepts (c) and Residual (u)
         if self.unsupervised_dim > 0:
             c = z[:, :-self.unsupervised_dim] 
             u = z[:, -self.unsupervised_dim:]
@@ -118,56 +139,18 @@ class CB_AE_Base(nn.Module):
             c = z
             u = None 
         
-        # 3. Adversarial Pass (if enabled)
+        # 4. Adversarial Pass (if enabled)
         adv_logits = None
         if self.use_adversarial and u is not None:
             # GRL reverses gradient here to confuse the classifier
             u_reversed = self.grl(u)
             adv_logits = self.residual_classifier(u_reversed)
         
-        # 4. Decode
-        recon = self.decoder(z)
+        # 5. Decode
+        recon_pooled = self.decoder(z) # (Batch, embed_dim)
         
-        # Reshape back to original input for the Transformer
-        if len(original_shape) > 2:
-            recon = recon.view(original_shape)
-            
-        if self.use_adversarial:
-            return recon, c, adv_logits
-        return recon, c
-
-# ==========================================
-# 3. Stream Implementations (Text & Image)
-# ==========================================
-
-class Text_CB_AE(CB_AE_Base):
-    """
-    Specialized for Text Stream (C_ctxt).
-    Uses Mean Pooling to compress the sequence (L=154) into a semantic vector
-    before bottlenecking, enforcing global semantic constraints.
-    """
-    def __init__(self, seq_len=154, embed_dim=4096, concept_dim=20, use_adversarial=False):
-        self.seq_len = seq_len
-        self.embed_dim = embed_dim
-        # We pool L=154 -> 1, so input to MLP is just embed_dim
-        super().__init__(input_dim=embed_dim, concept_dim=concept_dim, use_adversarial=use_adversarial)
-
-    def forward(self, x):
-        # x shape: (Batch, 154, 4096)
-        
-        # 1. POOLING: Compress sequence to get global semantics
-        x_pooled = x.mean(dim=1) # (Batch, 4096)
-        
-        # 2. Base Forward (Encode -> Bottleneck -> Decode)
-        # Note: The decoder reconstructs the POOLED vector (Batch, 4096)
-        if self.use_adversarial:
-            recon_pooled, c, adv_logits = super().forward(x_pooled)
-        else:
-            recon_pooled, c = super().forward(x_pooled)
-            adv_logits = None
-            
-        # 3. UNPOOLING / BROADCASTING
-        # We must return (Batch, 154, 4096) for the MM-DiT.
+        # 6. UNPOOLING / BROADCASTING
+        # We must return (Batch, seq_len, embed_dim) for the MM-DiT.
         # Since we mean-pooled, we expand the reconstructed vector back to the sequence length.
         # 
         # DESIGN CHOICE: This is a STRONG CONSTRAINT that forces every text token to 
@@ -185,49 +168,134 @@ class Text_CB_AE(CB_AE_Base):
             return recon, c, adv_logits
         return recon, c
 
-class Image_CB_AE(CB_AE_Base):
+class Image_CB_AE(nn.Module):
     """
-    Specialized for Image Stream (x_t).
-    Flattens the image patches to preserve spatial detail.
+    Spatial Concept Bottleneck Autoencoder for SD3.5 Image Stream.
     
-    Input: (Batch, num_patches, patch_dim) e.g., (B, 256, 4096)
-    Process: Flatten -> Encode -> Bottleneck -> Decode -> Reshape
+    Instead of a massive MLP, this uses Conv2d layers to process the 
+    spatial grid (48x48 patches), dramatically reducing parameter count 
+    while preserving spatial context.
+    
+    Default dimensions match SD3.5 Medium: num_patches=2304, patch_dim=1536
+    Input: (Batch, num_patches, patch_dim) e.g., (B, 2304, 1536)
     Output: (Batch, num_patches, patch_dim) - reconstructed image patches
     """
-    def __init__(self, num_patches=256, patch_dim=4096, concept_dim=20, use_adversarial=False):
-        self.num_patches = num_patches
+    def __init__(self, num_patches=2304, patch_dim=1536, concept_dim=2, use_adversarial=False):
+        super().__init__()
+        self.use_adversarial = use_adversarial
         self.patch_dim = patch_dim
-        # We flatten patches, so input is huge (256 * 4096)
-        # In practice, you might want a Conv1D encoder here to save params, 
-        # but this follows your 'flatten' request.
-        super().__init__(input_dim=num_patches*patch_dim, concept_dim=concept_dim, use_adversarial=use_adversarial)
-    
+        self.num_patches = num_patches
+        
+        # Calculate spatial side length: sqrt(2304) = 48
+        self.spatial_side = int(num_patches**0.5) 
+        
+        # Bottleneck logic
+        if self.use_adversarial:
+            self.unsupervised_dim = 16 
+        else:
+            self.unsupervised_dim = 0
+        self.total_bottleneck = concept_dim + self.unsupervised_dim
+
+        # --- ENCODER (Conv2d) ---
+        # Input: (B, 1536, 48, 48)
+        self.encoder = nn.Sequential(
+            # Downsample 48x48 -> 24x24
+            nn.Conv2d(patch_dim, 512, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.1),
+            
+            # Downsample 24x24 -> 12x12
+            nn.Conv2d(512, 256, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.1),
+            
+            # Global Average Pooling (12x12 -> 1x1)
+            # This collapses spatial dims to get a single concept vector
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            
+            # Projection to Concept Space
+            nn.Linear(256, self.total_bottleneck)
+        )
+
+        # --- DECODER (Transposed Conv) ---
+        # Map Concept -> Spatial Feature Map
+        self.decoder_input = nn.Sequential(
+            nn.Linear(self.total_bottleneck, 256 * 12 * 12),
+            nn.LeakyReLU(0.1)
+        )
+        
+        self.decoder_conv = nn.Sequential(
+            # Input: (B, 256, 12, 12) -> Upsample to 24x24
+            nn.ConvTranspose2d(256, 512, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.1),
+            
+            # Upsample 24x24 -> 48x48
+            nn.ConvTranspose2d(512, patch_dim, kernel_size=4, stride=2, padding=1),
+            # No activation at output (linear reconstruction)
+        )
+
+        # --- ADVERSARIAL BRANCH ---
+        if self.use_adversarial:
+            self.grl = GradientReversal(alpha=1.0)
+            self.residual_classifier = nn.Sequential(
+                nn.Linear(self.unsupervised_dim, 64),
+                nn.LeakyReLU(0.1),
+                nn.Linear(64, concept_dim) 
+            )
+        
+        # Initialize weights
+        self.apply(_weights_init)
+
     def forward(self, x):
         """
         Forward pass for image patches.
         
         Args:
             x: Image patches, shape (Batch, num_patches, patch_dim)
+               e.g., (B, 2304, 1536) for SD3.5 Medium
         
         Returns:
             recon: Reconstructed patches, shape (Batch, num_patches, patch_dim)
             c: Concept logits, shape (Batch, concept_dim)
             adv_logits: (Optional) Adversarial logits if use_adversarial=True
         """
-        # x shape: (Batch, num_patches, patch_dim) e.g., (B, 256, 4096)
-        original_shape = x.shape
+        # x input shape: (Batch, 2304, 1536)
+        batch_size = x.shape[0]
         
-        # Base forward handles flattening automatically: (B, L, D) -> (B, L*D)
-        # Then encodes to bottleneck, decodes, and we reshape back
-        if self.use_adversarial:
-            recon_flat, c, adv_logits = super().forward(x)
+        # 1. RESHAPE TO IMAGE (B, Dim, H, W)
+        # We perform a transpose to get channels first
+        x_spatial = x.transpose(1, 2).view(batch_size, self.patch_dim, self.spatial_side, self.spatial_side)
+        
+        # 2. ENCODE
+        z = self.encoder(x_spatial) # (Batch, total_bottleneck)
+        
+        # 3. SPLIT
+        if self.unsupervised_dim > 0:
+            c = z[:, :-self.unsupervised_dim] 
+            u = z[:, -self.unsupervised_dim:]
         else:
-            recon_flat, c = super().forward(x)
-            adv_logits = None
+            c = z
+            u = None 
+            
+        # 4. ADVERSARIAL
+        adv_logits = None
+        if self.use_adversarial and u is not None:
+            u_reversed = self.grl(u)
+            adv_logits = self.residual_classifier(u_reversed)
+            
+        # 5. DECODE
+        # Expand vector back to 12x12 feature map
+        rec_feat = self.decoder_input(z)
+        rec_feat = rec_feat.view(batch_size, 256, 12, 12)
         
-        # Reshape back to (Batch, num_patches, patch_dim)
-        # The base class already handles this via view(), but we make it explicit here
-        recon = recon_flat.view(original_shape)
+        # Upsample back to 48x48
+        recon_spatial = self.decoder_conv(rec_feat)
+        
+        # 6. RESHAPE BACK TO SEQUENCE (B, 2304, 1536)
+        # Flatten spatial dims and transpose back
+        recon = recon_spatial.flatten(2).transpose(1, 2)
         
         if self.use_adversarial:
             return recon, c, adv_logits
@@ -337,12 +405,12 @@ class DualStreamLoss(nn.Module):
 # Example Usage Script
 # ==========================================
 if __name__ == "__main__":
-    # Hyperparams
+    # Hyperparams - Updated to match SD3.5 Medium dimensions
     BS = 4
-    SEQ_LEN = 154
-    PATCHES = 256
-    DIM = 4096
-    CONCEPTS = 20
+    SEQ_LEN = 333      # Text sequence length for SD3.5 Medium
+    PATCHES = 2304     # Image patches for SD3.5 Medium (96x96/4 with patch_size=2)
+    DIM = 1536         # Hidden dimension (caption_projection_dim) for SD3.5 Medium
+    CONCEPTS = 2       # Number of concepts (concept_a: Food, concept_b: Container)
     
     # 1. Init Models (Toggle use_adversarial=True/False here)
     # Note: False = Hard Bottleneck (0 residual)

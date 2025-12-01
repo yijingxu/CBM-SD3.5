@@ -7,13 +7,18 @@ This document describes the training data structure for Concept Bottleneck Autoe
 ## Data Generation
 
 - **Model**: `stabilityai/stable-diffusion-3.5-medium`
-- **Samples per prompt**: 100
-- **Total samples**: 400 (4 prompts × 100 samples)
-- **Timestep range**: Randomly selected from 4-10 for each sample
+- **Samples per prompt**: 200
+- **Total samples**: 800 (4 prompts × 100 samples)
+- **Timestep range**: Randomly selected from 4-14 for each sample
 - **Transformer block**: Block 12 (out of 24 total blocks)
 - **Guidance scale**: Dynamic (4.5 → 10.0)
+- **Save dynamic text embedding**: `True` (saves text embedding per sample) or `False` (saves once per prompt)
 
 ## File Structure
+
+The file structure depends on the `save_dynamic_text_embedding` hyperparameter:
+
+### When `save_dynamic_text_embedding = False` (Static Mode)
 
 ```
 YijingCode/TrainingData/
@@ -29,6 +34,28 @@ YijingCode/TrainingData/
     │   ├── sample_000_noise.pt  # Noise prediction at step 7
     │   ├── sample_001_t04.pt    # Image latent at step 4
     │   ├── sample_001_noise.pt  # Noise prediction at step 4
+    │   └── ... (100 samples total)
+    ├── prompt_002/
+    │   └── ... (100 samples)
+    ├── prompt_003/
+    │   └── ... (100 samples)
+    └── prompt_004/
+        └── ... (100 samples)
+```
+
+### When `save_dynamic_text_embedding = True` (Dynamic Mode)
+
+```
+YijingCode/TrainingData/
+├── metadata.csv                 # The "Map": Links Prompt_ID <-> Sample_ID <-> Timestep
+└── image_trajectories/          # Dynamic Store (100 per prompt)
+    ├── prompt_001/
+    │   ├── sample_000_t07.pt           # Image latent at step 7
+    │   ├── sample_000_t07_text.pt      # Text embedding at step 7
+    │   ├── sample_000_noise.pt         # Noise prediction at step 7
+    │   ├── sample_001_t04.pt           # Image latent at step 4
+    │   ├── sample_001_t04_text.pt      # Text embedding at step 4
+    │   ├── sample_001_noise.pt         # Noise prediction at step 4
     │   └── ... (100 samples total)
     ├── prompt_002/
     │   └── ... (100 samples)
@@ -55,15 +82,29 @@ The metadata file serves as the central index linking all data components. Each 
 - `image_latent_path`: String - Relative path to image latent embedding file
 - `noise_pred_path`: String - Relative path to noise prediction file
 
-**Example row:**
+**Example rows:**
+
+When `save_dynamic_text_embedding = False`:
 ```csv
 prompt_id,sample_id,timestep,concept_a,concept_b,prompt_text,text_embedding_path,image_latent_path,noise_pred_path
 1,0,7,Ice Cream,Cone,"A scoop of ice cream served in a crunchy cone.",text_embeddings/prompt_001.pt,image_trajectories/prompt_001/sample_000_t07.pt,image_trajectories/prompt_001/sample_000_noise.pt
 ```
 
-### 2. Text Embeddings (`text_embeddings/`)
+When `save_dynamic_text_embedding = True`:
+```csv
+prompt_id,sample_id,timestep,concept_a,concept_b,prompt_text,text_embedding_path,image_latent_path,noise_pred_path
+1,0,7,Ice Cream,Cone,"A scoop of ice cream served in a crunchy cone.",image_trajectories/prompt_001/sample_000_t07_text.pt,image_trajectories/prompt_001/sample_000_t07.pt,image_trajectories/prompt_001/sample_000_noise.pt
+```
+
+### 2. Text Embeddings
 
 **Purpose**: Text embeddings processed by transformer block 12.
+
+**Two modes based on `save_dynamic_text_embedding` hyperparameter:**
+
+#### Mode 1: Static (`save_dynamic_text_embedding = False`)
+
+**Location**: `text_embeddings/` directory
 
 **Characteristics:**
 - **One file per prompt** (not duplicated across samples)
@@ -77,6 +118,27 @@ prompt_id,sample_id,timestep,concept_a,concept_b,prompt_text,text_embedding_path
 - **Usage**: Input to Text_CB_AE model
 
 **File naming**: `prompt_{prompt_id:03d}.pt`
+
+**Rationale**: Text embeddings are identical for all samples of the same prompt, so storing once per prompt saves storage space.
+
+#### Mode 2: Dynamic (`save_dynamic_text_embedding = True`)
+
+**Location**: `image_trajectories/prompt_{id}/` directory (same as image latents)
+
+**Characteristics:**
+- **100 files per prompt** (one per sample, saved at the captured timestep)
+- **Format**: PyTorch tensor (`.pt`)
+- **Shape**: `[1, 333, 1536]`
+  - `1`: Batch dimension
+  - `333`: Sequence length (text tokens)
+  - `1536`: Hidden dimension (`caption_projection_dim`)
+- **Dtype**: `torch.float32` (converted from bfloat16 for compatibility)
+- **Content**: Conditional branch only (text-guided embeddings)
+- **Usage**: Input to Text_CB_AE model, allows tracking text embeddings at different timesteps
+
+**File naming**: `sample_{sample_id:03d}_t{timestep:02d}_text.pt`
+
+**Rationale**: Enables analysis of text embeddings at different timesteps, useful for understanding how text representations evolve during the diffusion process.
 
 ### 3. Image Latent Embeddings (`image_trajectories/prompt_{id}/sample_{id}_t{timestep}.pt`)
 
@@ -143,10 +205,10 @@ The dataset includes two binary concepts:
    - Centralized metadata makes it easy to query and filter data
    - Flat tensor files are efficient for loading during training
 
-2. **No Text Embedding Duplication**:
-   - Text embeddings are identical for all samples of the same prompt
-   - Saves ~400MB of storage (100 samples × 4MB per embedding)
-   - Metadata links samples to their text embedding
+2. **Text Embedding Storage Modes**:
+   - **Static mode** (`save_dynamic_text_embedding = False`): Text embeddings are identical for all samples of the same prompt, so storing once per prompt saves ~400MB of storage (100 samples × 4MB per embedding)
+   - **Dynamic mode** (`save_dynamic_text_embedding = True`): Text embeddings are saved per sample, enabling analysis of text representations at different timesteps, useful for understanding timestep-dependent text embedding variations
+   - Metadata links samples to their text embedding regardless of mode
 
 3. **Organized by Prompt**:
    - Easy to find all samples for a specific prompt
@@ -190,14 +252,27 @@ concept_b = row['concept_b']  # "Cone" or "Plate"
 
 ## Statistics
 
+### When `save_dynamic_text_embedding = False` (Static Mode)
+
 - **Total files**: 804
   - 4 text embedding files
   - 400 image latent files (100 per prompt)
   - 400 noise prediction files (100 per prompt)
 - **Total samples**: 400
 - **Timestep distribution**: Uniform random from 4-10
+- **Storage per sample**: ~4MB (text, shared) + ~14MB (image) + ~0.6MB (noise) ≈ 19MB
+- **Total storage**: ~7.6GB (4 text + 400 image + 400 noise files)
+
+### When `save_dynamic_text_embedding = True` (Dynamic Mode)
+
+- **Total files**: 1200
+  - 400 text embedding files (100 per prompt)
+  - 400 image latent files (100 per prompt)
+  - 400 noise prediction files (100 per prompt)
+- **Total samples**: 400
+- **Timestep distribution**: Uniform random from 4-10
 - **Storage per sample**: ~4MB (text) + ~14MB (image) + ~0.6MB (noise) ≈ 19MB
-- **Total storage**: ~7.6GB (400 samples × 19MB)
+- **Total storage**: ~7.6GB (400 text + 400 image + 400 noise files)
 
 ## Notes
 
@@ -207,4 +282,6 @@ concept_b = row['concept_b']  # "Cone" or "Plate"
 - File paths in metadata are relative to `YijingCode/TrainingData/` directory
 - Sample IDs are zero-indexed (0-99)
 - Prompt IDs are one-indexed (1-4)
+- The `save_dynamic_text_embedding` hyperparameter controls whether text embeddings are saved once per prompt (static) or per sample (dynamic)
+- In dynamic mode, text embeddings are saved alongside image latents in the same directory with the `_text.pt` suffix
 

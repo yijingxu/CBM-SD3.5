@@ -23,8 +23,9 @@ start_scale_text = 4.5  # Starting guidance scale for dynamic mode
 end_scale_text = 10.0   # Ending guidance scale for dynamic mode
 
 # Data generation parameters
-samples_per_prompt = 100
-timestep_range = (4, 10)  # Random timestep selection range (inclusive)
+samples_per_prompt = 200
+timestep_range = (4, 16)  # Random timestep selection range (inclusive)
+save_dynamic_text_embedding = True  # Hyperparameter: save text embedding for each sample (True) or once per prompt (False)
 
 # Concept Sets:
 # Concept A: Food (Spaghetti vs. Ice Cream)
@@ -104,14 +105,37 @@ selected_block = pipe.transformer.transformer_blocks[transformer_block_idx]
 hook_handle = selected_block.register_forward_hook(make_block_output_hook(captured_block_output))
 
 print(f"\nRegistered hook on transformer block {transformer_block_idx}")
-print(f"Generating {samples_per_prompt} samples per prompt")
+print(f"Generating {samples_per_prompt} new samples per prompt")
 print(f"Random timestep range: {timestep_range[0]}-{timestep_range[1]}")
 if dynamic_guidance_scale:
     print(f"Using dynamic guidance scale: {start_scale_text} -> {end_scale_text}")
 else:
     print(f"Using static guidance scale: {guidance_scale}")
+print(f"Save dynamic text embedding: {save_dynamic_text_embedding}")
 
-# Initialize metadata list
+# --------------------------------------------------------------
+# Handle existing metadata so we can CONTINUE numbering samples
+# --------------------------------------------------------------
+existing_metadata = None
+max_sample_ids = {}  # Track max sample_id per prompt_id
+if metadata_path.exists():
+    print(f"\nFound existing metadata at {metadata_path}")
+    existing_metadata = pd.read_csv(metadata_path)
+    for prompt_id in range(1, len(prompts) + 1):
+        prompt_rows = existing_metadata[existing_metadata["prompt_id"] == prompt_id]
+        if len(prompt_rows) > 0:
+            max_id = int(prompt_rows["sample_id"].max())
+            max_sample_ids[prompt_id] = max_id
+            print(f"  Prompt {prompt_id}: existing samples 0-{max_id}, will continue from {max_id + 1}")
+        else:
+            max_sample_ids[prompt_id] = -1
+            print(f"  Prompt {prompt_id}: no existing samples, will start from 0")
+else:
+    print(f"\nNo existing metadata found. Starting sample_id from 0 for all prompts.")
+    for prompt_id in range(1, len(prompts) + 1):
+        max_sample_ids[prompt_id] = -1
+
+# Initialize metadata list for NEW records
 metadata_records = []
 
 # ============================================================
@@ -145,17 +169,24 @@ for prompt_idx, prompt in enumerate(prompts):
     # We'll get it from the first sample, but it's the same for all samples of this prompt
     text_embedding_saved = False
 
-    # Generate samples_per_prompt samples for this prompt
-    for sample_idx in range(samples_per_prompt):
+    # Determine starting / ending sample_id for this prompt
+    prompt_id = prompt_idx + 1
+    start_sample_id = max_sample_ids[prompt_id] + 1
+    end_sample_id = start_sample_id + samples_per_prompt
+    print(f"Generating samples {start_sample_id} to {end_sample_id - 1} for prompt {prompt_id}")
+
+    # Generate samples_per_prompt NEW samples for this prompt
+    for local_idx, sample_id in enumerate(range(start_sample_id, end_sample_id)):
         # Randomly select target timestep for this sample
         target_timestep_idx = random.randint(timestep_range[0], timestep_range[1])
         
-        print(f"\n  Sample {sample_idx + 1}/{samples_per_prompt} - Target timestep: {target_timestep_idx}")
+        print(f"\n  Sample {local_idx + 1}/{samples_per_prompt} (global id={sample_id}) - Target timestep: {target_timestep_idx}")
 
         captured_block_output.clear()
 
         # Use different seed for each sample to get diversity
-        generator = torch.Generator(device=device).manual_seed(42 + prompt_idx * 1000 + sample_idx)
+        # Include global sample_id to keep seeds consistent across runs
+        generator = torch.Generator(device=device).manual_seed(42 + prompt_idx * 1000 + sample_id)
 
         # Initialize latents - 768x768 image -> 96x96 latents
         H, W = 768, 768
@@ -208,19 +239,29 @@ for prompt_idx, prompt in enumerate(prompts):
                                 elif seq_len == 2304:  # 96*96/4 = 2304 (with patch_size=2)
                                     image_stream = item
                     
-                    # Save text embedding once per prompt (from first sample)
-                    if not text_embedding_saved and text_stream is not None:
+                    # Save text embedding
+                    if text_stream is not None:
                         uncond_text, cond_text = text_stream.chunk(2)
-                        text_embedding_path = text_embeddings_dir / f"prompt_{prompt_idx + 1:03d}.pt"
-                        torch.save(cond_text, text_embedding_path)
-                        print(f"    Saved text embedding to: {text_embedding_path}")
-                        print(f"      Shape: {cond_text.shape}, dtype: {cond_text.dtype}")
-                        text_embedding_saved = True
+                        
+                        if save_dynamic_text_embedding:
+                            # Save text embedding for each sample (similar to image stream)
+                            text_embedding_path = prompt_trajectory_dir / f"sample_{sample_id:03d}_t{target_timestep_idx:02d}_text.pt"
+                            torch.save(cond_text, text_embedding_path)
+                            print(f"    Saved text embedding to: {text_embedding_path}")
+                            print(f"      Shape: {cond_text.shape}, dtype: {cond_text.dtype}")
+                        else:
+                            # Save text embedding once per prompt (from first sample)
+                            if not text_embedding_saved:
+                                text_embedding_path = text_embeddings_dir / f"prompt_{prompt_idx + 1:03d}.pt"
+                                torch.save(cond_text, text_embedding_path)
+                                print(f"    Saved text embedding to: {text_embedding_path}")
+                                print(f"      Shape: {cond_text.shape}, dtype: {cond_text.dtype}")
+                                text_embedding_saved = True
                     
                     # Save image stream (latent embedding)
                     if image_stream is not None:
                         uncond_img, cond_img = image_stream.chunk(2)
-                        image_latent_path = prompt_trajectory_dir / f"sample_{sample_idx:03d}_t{target_timestep_idx:02d}.pt"
+                        image_latent_path = prompt_trajectory_dir / f"sample_{sample_id:03d}_t{target_timestep_idx:02d}.pt"
                         torch.save(cond_img, image_latent_path)
                         print(f"    Saved image latent to: {image_latent_path}")
                         print(f"      Shape: {cond_img.shape}, dtype: {cond_img.dtype}")
@@ -234,22 +275,27 @@ for prompt_idx, prompt in enumerate(prompts):
                     # Reshape noise prediction to match image stream format if needed
                     # noise_pred shape is [1, 16, 96, 96], we need to check if we should save it as-is
                     # or convert it to match the image stream format
-                    noise_path = prompt_trajectory_dir / f"sample_{sample_idx:03d}_noise.pt"
+                    noise_path = prompt_trajectory_dir / f"sample_{sample_id:03d}_noise.pt"
                     torch.save(noise_pred_tensor, noise_path)
                     print(f"    Saved noise prediction to: {noise_path}")
                     print(f"      Shape: {noise_pred_tensor.shape}, dtype: {noise_pred_tensor.dtype}")
                     
                     # Record metadata
+                    if save_dynamic_text_embedding:
+                        text_embedding_path_meta = f"image_trajectories/prompt_{prompt_idx + 1:03d}/sample_{sample_id:03d}_t{target_timestep_idx:02d}_text.pt"
+                    else:
+                        text_embedding_path_meta = f"text_embeddings/prompt_{prompt_idx + 1:03d}.pt"
+                    
                     metadata_records.append({
                         "prompt_id": prompt_idx + 1,
-                        "sample_id": sample_idx,
+                        "sample_id": sample_id,
                         "timestep": target_timestep_idx,
                         "concept_a": concept_labels[prompt_idx]["concept_a"],
                         "concept_b": concept_labels[prompt_idx]["concept_b"],
                         "prompt_text": prompt,
-                        "text_embedding_path": f"text_embeddings/prompt_{prompt_idx + 1:03d}.pt",
-                        "image_latent_path": f"image_trajectories/prompt_{prompt_idx + 1:03d}/sample_{sample_idx:03d}_t{target_timestep_idx:02d}.pt",
-                        "noise_pred_path": f"image_trajectories/prompt_{prompt_idx + 1:03d}/sample_{sample_idx:03d}_noise.pt",
+                        "text_embedding_path": text_embedding_path_meta,
+                        "image_latent_path": f"image_trajectories/prompt_{prompt_idx + 1:03d}/sample_{sample_id:03d}_t{target_timestep_idx:02d}.pt",
+                        "noise_pred_path": f"image_trajectories/prompt_{prompt_idx + 1:03d}/sample_{sample_id:03d}_noise.pt",
                     })
                 else:
                     print(f"    Warning: No output captured from transformer block {transformer_block_idx}")
@@ -261,23 +307,37 @@ for prompt_idx, prompt in enumerate(prompts):
             latents = pipe.scheduler.step(noise_pred_cfg, t, latents).prev_sample
 
         # Progress update
-        if (sample_idx + 1) % 10 == 0:
-            print(f"  Completed {sample_idx + 1}/{samples_per_prompt} samples for prompt {prompt_idx + 1}")
+        if (local_idx + 1) % 10 == 0:
+            print(f"  Completed {local_idx + 1}/{samples_per_prompt} new samples for prompt {prompt_idx + 1} (last global id={sample_id})")
 
-# Save metadata CSV
+# ---------------------------------------------
+# Save / append metadata CSV
+# ---------------------------------------------
 print(f"\n{'='*60}")
 print("Saving metadata...")
-metadata_df = pd.DataFrame(metadata_records)
-metadata_df.to_csv(metadata_path, index=False)
+new_metadata_df = pd.DataFrame(metadata_records)
+
+if existing_metadata is not None:
+    combined_metadata_df = pd.concat([existing_metadata, new_metadata_df], ignore_index=True)
+    combined_metadata_df.to_csv(metadata_path, index=False)
+    print(f"Appended {len(new_metadata_df)} new rows to existing metadata.")
+    print(f"Total rows in metadata: {len(combined_metadata_df)}")
+else:
+    new_metadata_df.to_csv(metadata_path, index=False)
+    print(f"Created new metadata with {len(new_metadata_df)} rows.")
+
 print(f"Saved metadata to: {metadata_path}")
-print(f"Total samples: {len(metadata_records)}")
-print(f"Metadata columns: {list(metadata_df.columns)}")
+print(f"New rows this run: {len(new_metadata_df)}")
+print(f"Metadata columns: {list(new_metadata_df.columns)}")
 
 hook_handle.remove()
 print(f"\n{'='*60}")
 print("Data generation complete!")
 print(f"  - Metadata: {metadata_path}")
-print(f"  - Text embeddings: {text_embeddings_dir} ({len(prompts)} files)")
+if save_dynamic_text_embedding:
+    print(f"  - Text embeddings: saved per sample in image_trajectories directories")
+else:
+    print(f"  - Text embeddings: {text_embeddings_dir} ({len(prompts)} files)")
 print(f"  - Image trajectories: {image_trajectories_dir}")
 print(f"  - Total samples: {len(metadata_records)}")
 print(f"{'='*60}")
