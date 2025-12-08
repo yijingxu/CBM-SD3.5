@@ -28,22 +28,22 @@ timestep_range = (4, 16)  # Random timestep selection range (inclusive)
 save_dynamic_text_embedding = True  # Hyperparameter: save text embedding for each sample (True) or once per prompt (False)
 
 # Concept Sets:
-# Concept A: Food (Spaghetti vs. Ice Cream)
-# Concept B: Container (Cone vs. Plate)
+# Concept A: Smile (Not Smiling vs. Smiling)
+# Concept B: Hair Color (Black vs. Blonde)
 prompts = [
-    "A scoop of ice cream served in a crunchy cone.",  # Concept A: Ice Cream | Concept B: Cone
-    "A scoop of ice cream served flat on a dinner plate.",  # Concept A: Ice Cream | Concept B: Plate
-    "A serving of spaghetti with sauce on a dinner plate.",  # Concept A: Spaghetti | Concept B: Plate
-    "A serving of spaghetti with sauce served in a crunchy cone.",  # Concept A: Spaghetti | Concept B: Cone
+    "A photo of a woman with a neutral expression, black hair, studio portrait.",         # Not Smiling | Black Hair
+    "A photo of a woman with a neutral expression, blonde hair, studio portrait.",        # Not Smiling | Blonde Hair
+    "A photo of a woman smiling widely, black hair, studio portrait.",                    # Smiling | Black Hair
+    "A photo of a woman smiling widely, blonde hair, studio portrait.",                   # Smiling | Blonde Hair
 ]
 
-# Ground truth concepts mapping
 concept_labels = {
-    0: {"concept_a": "Ice Cream", "concept_b": "Cone"},
-    1: {"concept_a": "Ice Cream", "concept_b": "Plate"},
-    2: {"concept_a": "Spaghetti", "concept_b": "Plate"},
-    3: {"concept_a": "Spaghetti", "concept_b": "Cone"},
+    0: {"concept_a": "Not Smiling", "concept_b": "Black Hair"},
+    1: {"concept_a": "Not Smiling", "concept_b": "Blonde Hair"},
+    2: {"concept_a": "Smiling",     "concept_b": "Black Hair"},
+    3: {"concept_a": "Smiling",     "concept_b": "Blonde Hair"},
 }
+
 
 # Paths to save the outputs
 base_dir = Path("YijingCode/TrainingData")
