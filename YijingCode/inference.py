@@ -8,13 +8,12 @@ from pathlib import Path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
-import torch.nn as nn
 import json
 import argparse
 from PIL import Image
 from diffusers import StableDiffusion3Pipeline
 
-from YijingCode.CBmodel import Text_CB_AE, Image_CB_AE
+from YijingCode.CBmodel import ConceptBottleneckTransformer
 from apps.env_utils import get_env_var
 
 # ==========================================
@@ -27,55 +26,48 @@ def load_config(config_path):
         config = json.load(f)
     return config
 
-def load_cbm_models(config, checkpoint_path, device):
-    """Load trained CBM models from checkpoint."""
-    # Initialize models with same config as training
-    text_model = Text_CB_AE(
-        seq_len=config['seq_len'],
+def load_cbm_model(config, checkpoint_path, device):
+    """Load unified CBM model from checkpoint."""
+    model = ConceptBottleneckTransformer(
+        text_len=config['seq_len'],
+        image_len=config['num_patches'],
         embed_dim=config['embed_dim'],
         concept_dim=config['concept_dim'],
-        hidden_dim=config['hidden_dim'],
+        num_heads=config.get('num_heads', 24),
+        num_encoder_layers=config.get('num_encoder_layers', 4),
+        num_decoder_layers=config.get('num_decoder_layers', 4),
+        ff_dim=config.get('ff_dim', 4096),
+        bottleneck_tokens=config.get('bottleneck_tokens', 4),
+        dropout=config.get('dropout', 0.1),
         use_adversarial=config.get('use_adversarial', False)
     ).to(device)
     
-    image_model = Image_CB_AE(
-        num_patches=config['num_patches'],
-        patch_dim=config['embed_dim'],
-        concept_dim=config['concept_dim'],
-        use_adversarial=config.get('use_adversarial', False)
-    ).to(device)
-    
-    # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    text_model.load_state_dict(checkpoint['text_model_state_dict'])
-    image_model.load_state_dict(checkpoint['image_model_state_dict'])
+    model.load_state_dict(checkpoint['model_state_dict'])
     
-    # Set to eval mode
-    text_model.eval()
-    image_model.eval()
+    model.eval()
     
-    print(f"Loaded CBM models from {checkpoint_path}")
-    print(f"  Text model parameters: {sum(p.numel() for p in text_model.parameters()):,}")
-    print(f"  Image model parameters: {sum(p.numel() for p in image_model.parameters()):,}")
+    print(f"Loaded CBM model from {checkpoint_path}")
+    print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
     
-    return text_model, image_model
+    return model
 
 # ==========================================
 # Concept Target Mapping
 # ==========================================
 
-# Concept A: Food (Ice Cream=0.0, Spaghetti=1.0)
-# Concept B: Container (Plate=0.0, Cone=1.0)
-CONCEPT_MAP_A = {"Ice Cream": 0.0, "Spaghetti": 1.0}
-CONCEPT_MAP_B = {"Plate": 0.0, "Cone": 1.0}
+# Concept A: Smile (Not Smiling=0.0, Smiling=1.0)
+# Concept B: Hair Color (Black Hair=0.0, Blonde Hair=1.0)
+CONCEPT_MAP_A = {"Not Smiling": 0.0, "Smiling": 1.0}
+CONCEPT_MAP_B = {"Black Hair": 0.0, "Blonde Hair": 1.0}
 
 def get_target_concept_vector(concept_a_target, concept_b_target):
     """
     Get target concept vector as tensor.
     
     Args:
-        concept_a_target: "Ice Cream" or "Spaghetti"
-        concept_b_target: "Plate" or "Cone"
+        concept_a_target: "Not Smiling" or "Smiling"
+        concept_b_target: "Black Hair" or "Blonde Hair"
     
     Returns:
         torch.Tensor: [concept_a_value, concept_b_value]
@@ -118,19 +110,17 @@ class CBMInterventionHook:
     for CFG), ensuring proper classifier-free guidance behavior.
     """
     
-    def __init__(self, text_model, image_model, target_concept, intervention_start_t=6, intervention_end_t=None, device='cuda'):
+    def __init__(self, cbm_model, target_concept, intervention_start_t=6, intervention_end_t=None, device='cuda'):
         """
         Args:
-            text_model: Trained Text_CB_AE model
-            image_model: Trained Image_CB_AE model
+            cbm_model: Trained ConceptBottleneckTransformer
             target_concept: torch.Tensor of shape [concept_dim] with target concept values
             intervention_start_t: Timestep index to start intervention (0-indexed)
             intervention_end_t: Timestep index to end intervention (0-indexed, inclusive). 
                                If None, intervention happens only once at intervention_start_t
             device: Device to run on
         """
-        self.text_model = text_model
-        self.image_model = image_model
+        self.cbm = cbm_model
         self.target_concept = target_concept.to(device)
         self.intervention_start_t = intervention_start_t
         self.intervention_end_t = intervention_end_t if intervention_end_t is not None else intervention_start_t
@@ -138,88 +128,18 @@ class CBMInterventionHook:
         self.current_timestep_idx = None
         self.intervention_applied = False  # Track if intervention has been applied (for single-shot mode)
         
-    def encode_and_force_concept(self, stream, is_text=True):
+    def encode_and_force_concept(self, text_stream, image_stream):
         """
-        Encode -> Force -> Decode -> **Normalize Moments**.
+        Encode both streams jointly, force the concept vector, and decode back.
         """
-        model = self.text_model if is_text else self.image_model
-        
-        # Store original dtype and device
-        original_dtype = stream.dtype
-        
-        # 1. CAPTURE STATISTICS (The Fix)
-        # We need to preserve the "energy" of the original stream
-        # Image stream (B, N, D): Normalize over features (dim=-1) or patches?
-        # Standard LayerNorm style: Normalize over the embedding dimension
-        orig_mean = stream.mean(dim=-1, keepdim=True)
-        orig_std = stream.std(dim=-1, keepdim=True)
-        
-        # Convert to float32 for CBM
-        stream_f32 = stream.float()
-        
+        original_dtype = text_stream.dtype
         with torch.no_grad():
-            if is_text:
-                # --- Text Processing ---
-                x_pooled = stream_f32.mean(dim=1)
-                z = model.encoder(x_pooled)
-                
-                if model.unsupervised_dim > 0:
-                    c = z[:, :-model.unsupervised_dim]
-                    u = z[:, -model.unsupervised_dim:]
-                else:
-                    c = z
-                    u = None
-                
-                # Force Target
-                target_concept = self.target_concept.to(stream_f32.device)
-                c_forced = target_concept.unsqueeze(0).expand(c.shape[0], -1)
-                
-                z_forced = torch.cat([c_forced, u], dim=1) if u is not None else c_forced
-                
-                recon_pooled = model.decoder(z_forced)
-                recon = recon_pooled.unsqueeze(1).expand(-1, model.seq_len, -1)
-                
-            else:
-                # --- Image Processing ---
-                batch_size = stream_f32.shape[0]
-                spatial_side = int(model.num_patches**0.5)
-                x_spatial = stream_f32.transpose(1, 2).view(batch_size, model.patch_dim, spatial_side, spatial_side)
-                
-                z = model.encoder(x_spatial)
-                
-                if model.unsupervised_dim > 0:
-                    c = z[:, :-model.unsupervised_dim]
-                    u = z[:, -model.unsupervised_dim:]
-                else:
-                    c = z
-                    u = None
-                
-                target_concept = self.target_concept.to(stream_f32.device)
-                c_forced = target_concept.unsqueeze(0).expand(c.shape[0], -1)
-                
-                z_forced = torch.cat([c_forced, u], dim=1) if u is not None else c_forced
-                
-                rec_feat = model.decoder_input(z_forced)
-                rec_feat = rec_feat.view(batch_size, 256, 12, 12)
-                recon_spatial = model.decoder_conv(rec_feat)
-                recon = recon_spatial.flatten(2).transpose(1, 2)
-
-            # 2. APPLY MOMENT MATCHING (The Fix)
-            # Normalize the reconstruction
-            recon_mean = recon.mean(dim=-1, keepdim=True)
-            recon_std = recon.std(dim=-1, keepdim=True) + 1e-6  # Avoid div by zero
-            
-            # Project reconstruction onto original statistics
-            # "Make the reconstruction have the same brightness/contrast as the input"
-            recon_normalized = ((recon - recon_mean) / recon_std) * orig_std + orig_mean
-            
-            # 3. OPTIONAL: Alpha Blending (Soft Injection)
-            # If Moment Matching isn't enough, blend the signal:
-            # 1.0 = Hard Replacement, 0.5 = 50% Mix
-            alpha = 0.8 
-            final_output = (alpha * recon_normalized) + ((1 - alpha) * stream_f32)
-
-            return final_output.to(dtype=original_dtype)
+            recon_text, recon_image, _, _ = self.cbm(
+                text_stream.float(),
+                image_stream.float(),
+                force_concept=self.target_concept,
+            )
+            return recon_text.to(dtype=original_dtype), recon_image.to(dtype=original_dtype)
     
     def make_hook_fn(self):
         """Create the hook function to register on transformer block."""
@@ -260,84 +180,46 @@ class CBMInterventionHook:
                             elif seq_len == 2304:  # Image stream
                                 image_idx = idx
                     
-                    # Apply intervention to text stream
-                    if text_idx is not None:
-                        text_stream = out[text_idx]
-                        # Handle CFG: text_stream might be [2*B, seq_len, embed_dim] (uncond + cond)
-                        if text_stream.shape[0] == 2:
-                            uncond_text, cond_text = text_stream.chunk(2)
-                            # Only intervene on conditional stream
-                            cond_text_modified = self.encode_and_force_concept(cond_text, is_text=True)
-                            text_stream_modified = torch.cat([uncond_text, cond_text_modified], dim=0)
-                        else:
-                            text_stream_modified = self.encode_and_force_concept(text_stream, is_text=True)
-                        
-                        # Replace in output tuple
-                        modified_outputs[text_idx] = text_stream_modified
-                    
-                    # Apply intervention to image stream
-                    if image_idx is not None:
-                        image_stream = out[image_idx]
-                        # Handle CFG: image_stream might be [2*B, num_patches, embed_dim]
-                        if image_stream.shape[0] == 2:
-                            uncond_img, cond_img = image_stream.chunk(2)
-                            # Only intervene on conditional stream
-                            cond_img_modified = self.encode_and_force_concept(cond_img, is_text=False)
-                            image_stream_modified = torch.cat([uncond_img, cond_img_modified], dim=0)
-                        else:
-                            image_stream_modified = self.encode_and_force_concept(image_stream, is_text=False)
-                        
-                    # Replace in output tuple
+                    if text_idx is None or image_idx is None:
+                        return out
+
+                    text_stream = out[text_idx]
+                    image_stream = out[image_idx]
+
+                    if text_stream.shape[0] == 2:
+                        uncond_text, cond_text = text_stream.chunk(2)
+                    else:
+                        uncond_text, cond_text = None, text_stream
+
+                    if image_stream.shape[0] == 2:
+                        uncond_img, cond_img = image_stream.chunk(2)
+                    else:
+                        uncond_img, cond_img = None, image_stream
+
+                    cond_text_mod, cond_img_mod = self.encode_and_force_concept(
+                        cond_text, cond_img
+                    )
+
+                    if uncond_text is not None:
+                        text_stream_modified = torch.cat([uncond_text, cond_text_mod], dim=0)
+                    else:
+                        text_stream_modified = cond_text_mod
+
+                    if uncond_img is not None:
+                        image_stream_modified = torch.cat([uncond_img, cond_img_mod], dim=0)
+                    else:
+                        image_stream_modified = cond_img_mod
+
+                    modified_outputs[text_idx] = text_stream_modified
                     modified_outputs[image_idx] = image_stream_modified
                     
-                    # Mark intervention as applied (for single-shot mode)
                     if self.intervention_start_t == self.intervention_end_t:
                         self.intervention_applied = True
                     return tuple(modified_outputs)
                 
-                # Handle BaseOutput objects (from diffusers)
-                elif hasattr(out, 'sample') or hasattr(out, 'hidden_states'):
-                    # Try to modify the sample or hidden_states attribute
-                    if hasattr(out, 'sample'):
-                        sample = out.sample
-                        if isinstance(sample, torch.Tensor) and len(sample.shape) >= 2:
-                            seq_len = sample.shape[1]
-                            if seq_len == 2304:  # Image stream
-                                if sample.shape[0] == 2:
-                                    uncond, cond = sample.chunk(2)
-                                    cond_modified = self.encode_and_force_concept(cond, is_text=False)
-                                    out.sample = torch.cat([uncond, cond_modified], dim=0)
-                                else:
-                                    out.sample = self.encode_and_force_concept(sample, is_text=False)
-                    # Mark intervention as applied (for single-shot mode)
-                    if self.intervention_start_t == self.intervention_end_t:
-                        self.intervention_applied = True
+                # Fallback: leave other output types unchanged
+                elif hasattr(out, 'sample') or hasattr(out, 'hidden_states') or isinstance(out, dict):
                     return out
-                
-                # Handle dict output
-                elif isinstance(out, dict):
-                    modified_out = out.copy()
-                    for key, value in out.items():
-                        if isinstance(value, torch.Tensor) and len(value.shape) >= 2:
-                            seq_len = value.shape[1]
-                            if seq_len == 333:  # Text stream
-                                if value.shape[0] == 2:
-                                    uncond, cond = value.chunk(2)
-                                    cond_modified = self.encode_and_force_concept(cond, is_text=True)
-                                    modified_out[key] = torch.cat([uncond, cond_modified], dim=0)
-                                else:
-                                    modified_out[key] = self.encode_and_force_concept(value, is_text=True)
-                            elif seq_len == 2304:  # Image stream
-                                if value.shape[0] == 2:
-                                    uncond, cond = value.chunk(2)
-                                    cond_modified = self.encode_and_force_concept(cond, is_text=False)
-                                    modified_out[key] = torch.cat([uncond, cond_modified], dim=0)
-                                else:
-                                    modified_out[key] = self.encode_and_force_concept(value, is_text=False)
-                    # Mark intervention as applied (for single-shot mode)
-                    if self.intervention_start_t == self.intervention_end_t:
-                        self.intervention_applied = True
-                    return modified_out
                 
             except Exception as e:
                 # If intervention fails, log error but don't crash
@@ -415,7 +297,7 @@ def run_inference_with_cbm(
     print()
     
     # Load CBM models
-    text_model, image_model = load_cbm_models(config, checkpoint_path, device)
+    cbm_model = load_cbm_model(config, checkpoint_path, device)
     
     # Get target concept vector
     target_concept = get_target_concept_vector(concept_a_target, concept_b_target)
@@ -442,8 +324,7 @@ def run_inference_with_cbm(
     
     # Create intervention hook
     intervention_hook = CBMInterventionHook(
-        text_model=text_model,
-        image_model=image_model,
+        cbm_model=cbm_model,
         target_concept=target_concept,
         intervention_start_t=intervention_start_t,
         intervention_end_t=intervention_end_t,
@@ -506,10 +387,6 @@ def run_inference_with_cbm(
             print(f"  [Step {i}] Engaging CBM Clamps...")
             # (Hook is already registered, just logic gate opens)
         
-        if i == intervention_end_t:
-            print(f"  [Step {i}] Releasing CBM Clamps (Restoring standard diffusion)...")
-            hook_handle.remove()  # NOW we remove it
-        
         # Prepare inputs for CFG
         latent_model_input = torch.cat([latents] * 2)
         pooled = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
@@ -531,6 +408,10 @@ def run_inference_with_cbm(
         
         # Update latents
         latents = pipe.scheduler.step(noise_pred_cfg, t, latents).prev_sample
+        
+        if i == intervention_end_t:
+            print(f"  [Step {i}] Releasing CBM Clamps (Restoring standard diffusion)...")
+            hook_handle.remove()
         
         # Log intervention status (for steps within window)
         if intervention_start_t < intervention_end_t:
@@ -583,13 +464,13 @@ def main():
                              'Examples: "YijingCode/checkpoints/training_config.json" (hard bottleneck) or '
                              '"YijingCode/checkpoints_adversarial/training_config.json" (soft bottleneck/adversarial)')
     
-    # Concept targets
-    parser.add_argument('--concept_a', type=str, default='Spaghetti',
-                        choices=['Ice Cream', 'Spaghetti'],
-                        help='Target for concept A (Food)')
-    parser.add_argument('--concept_b', type=str, default='Plate',
-                        choices=['Plate', 'Cone'],
-                        help='Target for concept B (Container)')
+# Concept targets
+parser.add_argument('--concept_a', type=str, default='Smiling',
+                    choices=['Not Smiling', 'Smiling'],
+                    help='Target for concept A (Smile)')
+parser.add_argument('--concept_b', type=str, default='Black Hair',
+                    choices=['Black Hair', 'Blonde Hair'],
+                    help='Target for concept B (Hair Color)')
     
     # Intervention parameters
     parser.add_argument('--intervention_start_t', type=int, default=6,
@@ -638,4 +519,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

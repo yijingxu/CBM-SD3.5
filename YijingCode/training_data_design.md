@@ -183,19 +183,19 @@ prompt_id,sample_id,timestep,concept_a,concept_b,prompt_text,text_embedding_path
 
 The dataset includes two binary concepts:
 
-### Concept A: Food Type
-- **"Ice Cream"**: Prompts 1, 2
-- **"Spaghetti"**: Prompts 3, 4
+### Concept A: Smile
+- **"Not Smiling"**: Prompts 1, 2
+- **"Smiling"**: Prompts 3, 4
 
-### Concept B: Container Type
-- **"Cone"**: Prompts 1, 4
-- **"Plate"**: Prompts 2, 3
+### Concept B: Hair Color
+- **"Black Hair"**: Prompts 1, 3
+- **"Blonde Hair"**: Prompts 2, 4
 
-**Prompt Mapping:**
-1. Prompt 1: Ice Cream + Cone
-2. Prompt 2: Ice Cream + Plate
-3. Prompt 3: Spaghetti + Plate
-4. Prompt 4: Spaghetti + Cone
+**Prompt Mapping (from latent_embedding.py prompts):**
+1. Prompt 1: Not Smiling + Black Hair
+2. Prompt 2: Not Smiling + Blonde Hair
+3. Prompt 3: Smiling + Black Hair
+4. Prompt 4: Smiling + Blonde Hair
 
 ## Design Rationale
 
@@ -284,4 +284,3 @@ concept_b = row['concept_b']  # "Cone" or "Plate"
 - Prompt IDs are one-indexed (1-4)
 - The `save_dynamic_text_embedding` hyperparameter controls whether text embeddings are saved once per prompt (static) or per sample (dynamic)
 - In dynamic mode, text embeddings are saved alongside image latents in the same directory with the `_text.pt` suffix
-

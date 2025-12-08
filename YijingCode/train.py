@@ -8,150 +8,178 @@ from pathlib import Path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 import argparse
 import json
 from datetime import datetime
 
-from YijingCode.CBmodel import Text_CB_AE, Image_CB_AE, DualStreamLoss
+from YijingCode.CBmodel import ConceptBottleneckTransformer, CombinedLoss
 from YijingCode.dataset import DualStreamDataset, get_dataloader
 
-def train_epoch(models, loss_fn, dataloader, optimizer, device, epoch, print_freq=10):
+# Optional Weights & Biases support
+try:
+    import wandb  # type: ignore
+except ImportError:
+    wandb = None
+
+def _build_intervention_targets(labels):
+    """Flip one random concept per sample to simulate training-time intervention."""
+    bsz, num_c = labels.shape
+    idx = torch.randint(0, num_c, (bsz,), device=labels.device)
+    flipped = labels.clone()
+    flipped[torch.arange(bsz), idx] = 1.0 - flipped[torch.arange(bsz), idx]
+    return flipped
+
+
+def train_epoch(model, loss_fn, dataloader, optimizer, device, epoch, print_freq=10):
     """Train for one epoch."""
-    text_model, image_model = models
-    text_model.train()
-    image_model.train()
-    
+    model.train()
+
     total_loss = 0.0
     total_recon = 0.0
+    total_recon_text = 0.0
+    total_recon_image = 0.0
     total_concept = 0.0
-    total_consistency = 0.0
+    total_intervene = 0.0
     total_adversarial = 0.0
     num_batches = 0
-    
+
     for batch_idx, batch in enumerate(dataloader):
-        # Move data to device
-        text_emb = batch['text_emb'].to(device)
-        image_lat = batch['image_lat'].to(device)
-        labels = batch['labels'].to(device)
-        
-        # Forward pass
-        txt_out = text_model(text_emb)
-        img_out = image_model(image_lat)
-        
-        # Compute loss
-        losses = loss_fn(
-            img_out=img_out,
-            txt_out=txt_out,
-            target_img=image_lat,
-            target_txt=text_emb,
-            pseudo_labels=labels
+        text_emb = batch["text_emb"].to(device)
+        image_lat = batch["image_lat"].to(device)
+        labels = batch["labels"].to(device)
+
+        # Forward pass (original concepts)
+        outputs = model(text_emb, image_lat)
+
+        # Intervention path: force a random concept flip, decode, re-encode to enforce steerability
+        intervened_labels = _build_intervention_targets(labels)
+        recon_text_int, recon_image_int, _, _ = model(
+            text_emb, image_lat, force_concept=intervened_labels
         )
-        
-        # Backward pass
+        concept_logits_int = model.encode_only(recon_text_int.detach(), recon_image_int.detach())
+        intervened = {"concept_logits": concept_logits_int, "target": intervened_labels}
+
+        losses = loss_fn(
+            outputs=outputs,
+            targets=(text_emb, image_lat),
+            pseudo_labels=labels,
+            intervened=intervened,
+        )
+
         optimizer.zero_grad()
-        losses['total'].backward()
+        losses["total"].backward()
         optimizer.step()
-        
-        # Accumulate metrics
-        total_loss += losses['total'].item()
-        total_recon += losses['recon']
-        total_concept += losses['concept']
-        total_consistency += losses['consistency']
-        total_adversarial += losses['adversarial']
+
+        total_loss += losses["total"].item()
+        total_recon += losses["recon"]
+        total_recon_text += losses["recon_text"]
+        total_recon_image += losses["recon_image"]
+        total_concept += losses["concept"]
+        total_intervene += losses["intervene"]
+        total_adversarial += losses["adversarial"]
         num_batches += 1
-        
-        # Print progress
+
         if (batch_idx + 1) % print_freq == 0:
-            print(f"  Batch {batch_idx + 1}/{len(dataloader)} | "
-                  f"Loss: {losses['total'].item():.4f} | "
-                  f"Recon: {losses['recon']:.4f} | "
-                  f"Concept: {losses['concept']:.4f} | "
-                  f"Consistency: {losses['consistency']:.4f}")
-    
-    # Average metrics
+            print(
+                f"  Batch {batch_idx + 1}/{len(dataloader)} | "
+                f"Loss: {losses['total'].item():.4f} | "
+                f"Recon: {losses['recon']:.4f} (txt {losses['recon_text']:.4f} / img {losses['recon_image']:.4f}) | "
+                f"Concept: {losses['concept']:.4f} | "
+                f"Intervene: {losses['intervene']:.4f}"
+            )
+
     avg_loss = total_loss / num_batches
     avg_recon = total_recon / num_batches
+    avg_recon_text = total_recon_text / num_batches
+    avg_recon_image = total_recon_image / num_batches
     avg_concept = total_concept / num_batches
-    avg_consistency = total_consistency / num_batches
+    avg_intervene = total_intervene / num_batches
     avg_adversarial = total_adversarial / num_batches
-    
+
     return {
-        'loss': avg_loss,
-        'recon': avg_recon,
-        'concept': avg_concept,
-        'consistency': avg_consistency,
-        'adversarial': avg_adversarial
+        "loss": avg_loss,
+        "recon": avg_recon,
+        "recon_text": avg_recon_text,
+        "recon_image": avg_recon_image,
+        "concept": avg_concept,
+        "intervene": avg_intervene,
+        "adversarial": avg_adversarial,
     }
 
-def validate(models, loss_fn, dataloader, device):
-    """Validate the models."""
-    text_model, image_model = models
-    text_model.eval()
-    image_model.eval()
-    
+
+def validate(model, loss_fn, dataloader, device):
+    """Validate the model."""
+    model.eval()
+
     total_loss = 0.0
     total_recon = 0.0
+    total_recon_text = 0.0
+    total_recon_image = 0.0
     total_concept = 0.0
-    total_consistency = 0.0
+    total_intervene = 0.0
     num_batches = 0
-    
+
     with torch.no_grad():
         for batch in dataloader:
-            text_emb = batch['text_emb'].to(device)
-            image_lat = batch['image_lat'].to(device)
-            labels = batch['labels'].to(device)
-            
-            txt_out = text_model(text_emb)
-            img_out = image_model(image_lat)
-            
-            losses = loss_fn(
-                img_out=img_out,
-                txt_out=txt_out,
-                target_img=image_lat,
-                target_txt=text_emb,
-                pseudo_labels=labels
+            text_emb = batch["text_emb"].to(device)
+            image_lat = batch["image_lat"].to(device)
+            labels = batch["labels"].to(device)
+
+            outputs = model(text_emb, image_lat)
+
+            intervened_labels = _build_intervention_targets(labels)
+            recon_text_int, recon_image_int, _, _ = model(
+                text_emb, image_lat, force_concept=intervened_labels
             )
-            
-            total_loss += losses['total'].item()
-            total_recon += losses['recon']
-            total_concept += losses['concept']
-            total_consistency += losses['consistency']
+            concept_logits_int = model.encode_only(recon_text_int, recon_image_int)
+            intervened = {"concept_logits": concept_logits_int, "target": intervened_labels}
+
+            losses = loss_fn(
+                outputs=outputs,
+                targets=(text_emb, image_lat),
+                pseudo_labels=labels,
+                intervened=intervened,
+            )
+
+            total_loss += losses["total"].item()
+            total_recon += losses["recon"]
+            total_recon_text += losses["recon_text"]
+            total_recon_image += losses["recon_image"]
+            total_concept += losses["concept"]
+            total_intervene += losses["intervene"]
             num_batches += 1
-    
+
     return {
-        'loss': total_loss / num_batches,
-        'recon': total_recon / num_batches,
-        'concept': total_concept / num_batches,
-        'consistency': total_consistency / num_batches
+        "loss": total_loss / num_batches,
+        "recon": total_recon / num_batches,
+        "recon_text": total_recon_text / num_batches,
+        "recon_image": total_recon_image / num_batches,
+        "concept": total_concept / num_batches,
+        "intervene": total_intervene / num_batches,
     }
 
-def save_checkpoint(models, optimizer, epoch, metrics, checkpoint_dir, is_best=False):
+
+def save_checkpoint(model, optimizer, epoch, metrics, checkpoint_dir, is_best=False):
     """Save model checkpoint."""
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    
-    text_model, image_model = models
-    
+
     checkpoint = {
-        'epoch': epoch,
-        'text_model_state_dict': text_model.state_dict(),
-        'image_model_state_dict': image_model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'metrics': metrics
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "metrics": metrics,
     }
-    
-    # Save regular checkpoint
-    checkpoint_path = checkpoint_dir / f'checkpoint_epoch_{epoch:04d}.pt'
+
+    checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch:04d}.pt"
     torch.save(checkpoint, checkpoint_path)
-    
-    # Save best model
+
     if is_best:
-        best_path = checkpoint_dir / 'best_model.pt'
+        best_path = checkpoint_dir / "best_model.pt"
         torch.save(checkpoint, best_path)
         print(f"  Saved best model to {best_path}")
-    
+
     print(f"  Saved checkpoint to {checkpoint_path}")
 
 def main():
@@ -174,8 +202,18 @@ def main():
                         help='Embedding dimension (SD3.5 Medium: 1536)')
     parser.add_argument('--concept_dim', type=int, default=2,
                         help='Number of concepts')
-    parser.add_argument('--hidden_dim', type=int, default=1024,
-                        help='Hidden dimension for text MLP (reduce to shrink params)')
+    parser.add_argument('--num_heads', type=int, default=24,
+                        help='Attention heads for transformer encoder/decoder')
+    parser.add_argument('--num_encoder_layers', type=int, default=4,
+                        help='Transformer encoder layers')
+    parser.add_argument('--num_decoder_layers', type=int, default=4,
+                        help='Transformer decoder layers')
+    parser.add_argument('--ff_dim', type=int, default=4096,
+                        help='Feed-forward width inside transformer blocks')
+    parser.add_argument('--bottleneck_tokens', type=int, default=4,
+                        help='Number of learned concept tokens passed through encoder/decoder memory')
+    parser.add_argument('--dropout', type=float, default=0.1,
+                        help='Dropout used inside transformer blocks')
     parser.add_argument('--use_adversarial', action='store_true',
                         help='Use adversarial training (soft bottleneck)')
     
@@ -192,8 +230,8 @@ def main():
                         help='Weight for reconstruction loss')
     parser.add_argument('--lambda_concept', type=float, default=1.0,
                         help='Weight for concept alignment loss')
-    parser.add_argument('--lambda_consist', type=float, default=5.0,
-                        help='Weight for cross-modal consistency loss')
+    parser.add_argument('--lambda_intervene', type=float, default=1.0,
+                        help='Weight for intervention cycle loss')
     parser.add_argument('--lambda_adv', type=float, default=0.5,
                         help='Weight for adversarial loss')
     
@@ -214,12 +252,36 @@ def main():
                         help='Print training stats every N batches')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
+    parser.add_argument('--wandb_project', type=str, default=None,
+                        help='W&B project name (logging disabled if not set)')
+    parser.add_argument('--wandb_entity', type=str, default=None,
+                        help='W&B entity/user (optional)')
+    parser.add_argument('--wandb_run_name', type=str, default=None,
+                        help='W&B run name (optional)')
+    parser.add_argument('--wandb_mode', type=str, default='online',
+                        choices=['online', 'offline', 'disabled'],
+                        help='W&B mode')
     
     args = parser.parse_args()
     
     # Device setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
+
+    # W&B setup
+    wandb_run = None
+    if args.wandb_project and args.wandb_mode != 'disabled':
+        if wandb is None:
+            print("wandb not installed; skipping W&B logging.")
+        else:
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=args.wandb_run_name,
+                config=vars(args),
+                mode=args.wandb_mode,
+            )
+            wandb.config.update({"device": str(device)}, allow_val_change=True)
     
     # Create checkpoint directory
     checkpoint_dir = Path(args.checkpoint_dir)
@@ -233,40 +295,35 @@ def main():
     
     # Initialize models
     print("\nInitializing models...")
-    text_model = Text_CB_AE(
-        seq_len=args.seq_len,
+    model = ConceptBottleneckTransformer(
+        text_len=args.seq_len,
+        image_len=args.num_patches,
         embed_dim=args.embed_dim,
         concept_dim=args.concept_dim,
-        hidden_dim=args.hidden_dim,
-        use_adversarial=args.use_adversarial
-    ).to(device)
-    
-    image_model = Image_CB_AE(
-        num_patches=args.num_patches,
-        patch_dim=args.embed_dim,
-        concept_dim=args.concept_dim,
-        use_adversarial=args.use_adversarial
+        num_heads=args.num_heads,
+        num_encoder_layers=args.num_encoder_layers,
+        num_decoder_layers=args.num_decoder_layers,
+        ff_dim=args.ff_dim,
+        bottleneck_tokens=args.bottleneck_tokens,
+        dropout=args.dropout,
+        use_adversarial=args.use_adversarial,
     ).to(device)
     
     # Count parameters
-    text_params = sum(p.numel() for p in text_model.parameters())
-    image_params = sum(p.numel() for p in image_model.parameters())
-    print(f"Text model parameters: {text_params:,}")
-    print(f"Image model parameters: {image_params:,}")
-    print(f"Total parameters: {text_params + image_params:,}")
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Unified CBM parameters: {total_params:,}")
     
     # Initialize loss function
-    loss_fn = DualStreamLoss(
+    loss_fn = CombinedLoss(
         lambda_recon=args.lambda_recon,
         lambda_concept=args.lambda_concept,
-        lambda_consist=args.lambda_consist,
-        lambda_adv=args.lambda_adv
+        lambda_intervene=args.lambda_intervene,
+        lambda_adv=args.lambda_adv,
     )
     
     # Initialize optimizer
-    all_params = list(text_model.parameters()) + list(image_model.parameters())
     optimizer = torch.optim.AdamW(
-        all_params,
+        model.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay
     )
@@ -313,8 +370,7 @@ def main():
     if args.resume:
         print(f"\nResuming from checkpoint: {args.resume}")
         checkpoint = torch.load(args.resume, map_location=device)
-        text_model.load_state_dict(checkpoint['text_model_state_dict'])
-        image_model.load_state_dict(checkpoint['image_model_state_dict'])
+        model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         if 'best_val_loss' in checkpoint:
@@ -334,7 +390,7 @@ def main():
         
         # Train
         train_metrics = train_epoch(
-            models=(text_model, image_model),
+            model=model,
             loss_fn=loss_fn,
             dataloader=train_loader,
             optimizer=optimizer,
@@ -345,7 +401,7 @@ def main():
         
         # Validate
         val_metrics = validate(
-            models=(text_model, image_model),
+            model=model,
             loss_fn=loss_fn,
             dataloader=val_loader,
             device=device
@@ -355,15 +411,51 @@ def main():
         print(f"\nEpoch {epoch + 1} Summary:")
         print(f"  Train Loss: {train_metrics['loss']:.4f}")
         print(f"    Train Recon: {train_metrics['recon']:.4f}")
+        print(f"      Train Recon Text: {train_metrics['recon_text']:.4f}")
+        print(f"      Train Recon Image: {train_metrics['recon_image']:.4f}")
         print(f"    Train Concept: {train_metrics['concept']:.4f}")
-        print(f"    Train Consistency: {train_metrics['consistency']:.4f}")
+        print(f"    Train Intervene: {train_metrics['intervene']:.4f}")
         if args.use_adversarial:
             print(f"    Train Adversarial: {train_metrics['adversarial']:.4f}")
         
         print(f"  Val Loss: {val_metrics['loss']:.4f}")
         print(f"    Val Recon: {val_metrics['recon']:.4f}")
+        print(f"      Val Recon Text: {val_metrics['recon_text']:.4f}")
+        print(f"      Val Recon Image: {val_metrics['recon_image']:.4f}")
         print(f"    Val Concept: {val_metrics['concept']:.4f}")
-        print(f"    Val Consistency: {val_metrics['consistency']:.4f}")
+        print(f"    Val Intervene: {val_metrics['intervene']:.4f}")
+
+        # W&B logging (relative metrics include gap to previous best)
+        if wandb_run is not None:
+            prev_best = best_val_loss
+            best_val_for_log = min(prev_best, val_metrics["loss"])
+            gap_prev_best = None if not torch.isfinite(torch.tensor(prev_best)) else val_metrics["loss"] - prev_best
+            improvement = 0.0
+            if gap_prev_best is not None and gap_prev_best < 0:
+                improvement = -gap_prev_best
+
+            wandb.log(
+                {
+                    "epoch": epoch + 1,
+                    "train/loss": train_metrics["loss"],
+                    "train/recon": train_metrics["recon"],
+                    "train/recon_text": train_metrics["recon_text"],
+                    "train/recon_image": train_metrics["recon_image"],
+                    "train/concept": train_metrics["concept"],
+                    "train/intervene": train_metrics["intervene"],
+                    "train/adversarial": train_metrics.get("adversarial", 0.0),
+                    "val/loss": val_metrics["loss"],
+                    "val/recon": val_metrics["recon"],
+                    "val/recon_text": val_metrics["recon_text"],
+                    "val/recon_image": val_metrics["recon_image"],
+                    "val/concept": val_metrics["concept"],
+                    "val/intervene": val_metrics["intervene"],
+                    "val/best_gap": gap_prev_best if gap_prev_best is not None else float("nan"),
+                    "val/improvement": improvement,
+                    "best/val_loss": best_val_for_log if torch.isfinite(torch.tensor(best_val_for_log)) else float("inf"),
+                },
+                step=epoch + 1,
+            )
         
         # Early stopping check (use validation loss)
         if val_metrics['loss'] < best_val_loss - args.early_stop_min_delta:
@@ -377,7 +469,7 @@ def main():
         if (epoch + 1) % args.save_freq == 0 or (epoch + 1) == args.epochs:
             is_best = val_metrics['loss'] <= best_val_loss
             save_checkpoint(
-                models=(text_model, image_model),
+                model=model,
                 optimizer=optimizer,
                 epoch=epoch,
                 metrics={'train': train_metrics, 'val': val_metrics, 'best_val_loss': best_val_loss},
@@ -395,6 +487,8 @@ def main():
     print(f"Best model saved to: {checkpoint_dir / 'best_model.pt'}")
     print(f"{'='*60}")
 
+    if wandb_run is not None:
+        wandb.finish()
+
 if __name__ == "__main__":
     main()
-

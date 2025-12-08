@@ -31,10 +31,10 @@ class DualStreamDataset(Dataset):
         self.transform = transform
 
         # Concept Mappings (Hardcoded for your 2x2 grid)
-        # Concept A: Food (Ice Cream=0, Spaghetti=1)
-        # Concept B: Container (Plate=0, Cone=1)
-        self.concept_map_a = {"Ice Cream": 0.0, "Spaghetti": 1.0}
-        self.concept_map_b = {"Plate": 0.0, "Cone": 1.0}
+        # Concept A: Smile (Not Smiling=0, Smiling=1)
+        # Concept B: Hair Color (Black Hair=0, Blonde Hair=1)
+        self.concept_map_a = {"Not Smiling": 0.0, "Smiling": 1.0}
+        self.concept_map_b = {"Black Hair": 0.0, "Blonde Hair": 1.0}
 
         # Verification check - at least one data directory should exist
         has_text_dir = (self.base_dir / "text_embeddings").exists()
