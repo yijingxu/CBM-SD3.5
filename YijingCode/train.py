@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 import argparse
 import json
 from datetime import datetime
+import tempfile
 
 from YijingCode.CBmodel import ConceptBottleneckTransformer, CombinedLoss
 from YijingCode.dataset import DualStreamDataset, get_dataloader
@@ -21,6 +22,13 @@ try:
     import wandb  # type: ignore
 except ImportError:
     wandb = None
+
+# Optional Hugging Face Hub support
+try:
+    from huggingface_hub import HfApi, HfFolder
+except ImportError:
+    HfApi = None
+    HfFolder = None
 
 def _build_intervention_targets(labels):
     """Flip one random concept per sample to simulate training-time intervention."""
@@ -160,7 +168,19 @@ def validate(model, loss_fn, dataloader, device):
     }
 
 
-def save_checkpoint(model, optimizer, epoch, metrics, checkpoint_dir, is_best=False):
+def save_checkpoint(
+    model,
+    optimizer,
+    epoch,
+    metrics,
+    checkpoint_dir,
+    is_best=False,
+    hf_api=None,
+    hf_repo_id=None,
+    hf_branch="main",
+    keep_local=True,
+    config_path=None,
+):
     """Save model checkpoint."""
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -172,15 +192,52 @@ def save_checkpoint(model, optimizer, epoch, metrics, checkpoint_dir, is_best=Fa
         "metrics": metrics,
     }
 
-    checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch:04d}.pt"
-    torch.save(checkpoint, checkpoint_path)
+    checkpoint_name = f"checkpoint_epoch_{epoch:04d}.pt"
+    best_name = "best_model.pt"
 
+    def upload_file(local_path, remote_name):
+        if hf_api is None or hf_repo_id is None:
+            return
+        hf_api.upload_file(
+            path_or_fileobj=str(local_path),
+            path_in_repo=remote_name,
+            repo_id=hf_repo_id,
+            repo_type="model",
+            revision=hf_branch,
+        )
+
+    # Save/upload current checkpoint
+    checkpoint_path = checkpoint_dir / checkpoint_name
+    if keep_local or hf_api is None:
+        torch.save(checkpoint, checkpoint_path)
+        print(f"  Saved checkpoint to {checkpoint_path}")
+    if hf_api is not None and hf_repo_id is not None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_ckpt = Path(tmpdir) / checkpoint_name
+            torch.save(checkpoint, tmp_ckpt)
+            upload_file(tmp_ckpt, checkpoint_name)
+            print(f"  Uploaded checkpoint to HF: {hf_repo_id}/{checkpoint_name}")
+
+    # Save/upload best checkpoint
     if is_best:
-        best_path = checkpoint_dir / "best_model.pt"
-        torch.save(checkpoint, best_path)
-        print(f"  Saved best model to {best_path}")
+        best_path = checkpoint_dir / best_name
+        if keep_local or hf_api is None:
+            torch.save(checkpoint, best_path)
+            print(f"  Saved best model to {best_path}")
+        if hf_api is not None and hf_repo_id is not None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_best = Path(tmpdir) / best_name
+                torch.save(checkpoint, tmp_best)
+                upload_file(tmp_best, best_name)
+                print(f"  Uploaded best model to HF: {hf_repo_id}/{best_name}")
 
-    print(f"  Saved checkpoint to {checkpoint_path}")
+    # Upload config for reference
+    if config_path is not None and config_path.exists() and hf_api is not None and hf_repo_id is not None:
+        try:
+            upload_file(config_path, config_path.name)
+            print(f"  Uploaded config to HF: {hf_repo_id}/{config_path.name}")
+        except Exception as e:
+            print(f"  Warning: failed to upload config: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description='Train Dual-Stream Concept Bottleneck Models')
@@ -261,6 +318,14 @@ def main():
     parser.add_argument('--wandb_mode', type=str, default='online',
                         choices=['online', 'offline', 'disabled'],
                         help='W&B mode')
+    parser.add_argument('--hf_repo_id', type=str, default=None,
+                        help='Hugging Face repo to upload checkpoints (model repo). If set, checkpoints upload instead of local save.')
+    parser.add_argument('--hf_token', type=str, default=None,
+                        help='Hugging Face token (defaults to HF_TOKEN env or cached).')
+    parser.add_argument('--hf_branch', type=str, default='main',
+                        help='Hugging Face repo branch to upload to.')
+    parser.add_argument('--hf_keep_local', action='store_true',
+                        help='Keep local checkpoint copies even when uploading to HF.')
     
     args = parser.parse_args()
     
@@ -270,6 +335,8 @@ def main():
 
     # W&B setup
     wandb_run = None
+    hf_api = None
+
     if args.wandb_project and args.wandb_mode != 'disabled':
         if wandb is None:
             print("wandb not installed; skipping W&B logging.")
@@ -282,6 +349,23 @@ def main():
                 mode=args.wandb_mode,
             )
             wandb.config.update({"device": str(device)}, allow_val_change=True)
+
+    # HF Hub setup
+    if args.hf_repo_id:
+        if HfApi is None:
+            print("huggingface_hub not installed; cannot upload checkpoints.")
+        else:
+            token = args.hf_token or os.environ.get("HF_TOKEN") or (HfFolder.get_token() if HfFolder else None)
+            if token is None:
+                print("No HF token provided; set --hf_token or HF_TOKEN env to enable uploads.")
+            else:
+                hf_api = HfApi(token=token)
+                try:
+                    hf_api.create_repo(args.hf_repo_id, repo_type="model", exist_ok=True, private=True)
+                    print(f"HF repo ready: {args.hf_repo_id} (private)")
+                except Exception as e:
+                    print(f"Warning: could not ensure HF repo {args.hf_repo_id}: {e}")
+                    hf_api = None
     
     # Create checkpoint directory
     checkpoint_dir = Path(args.checkpoint_dir)
@@ -292,6 +376,18 @@ def main():
     with open(config_path, 'w') as f:
         json.dump(vars(args), f, indent=2)
     print(f"Saved training config to {config_path}")
+    if hf_api is not None and args.hf_repo_id:
+        try:
+            hf_api.upload_file(
+                path_or_fileobj=str(config_path),
+                path_in_repo='training_config.json',
+                repo_id=args.hf_repo_id,
+                repo_type="model",
+                revision=args.hf_branch,
+            )
+            print(f"Uploaded training config to HF: {args.hf_repo_id}/training_config.json")
+        except Exception as e:
+            print(f"Warning: failed to upload training config to HF: {e}")
     
     # Initialize models
     print("\nInitializing models...")
@@ -474,7 +570,12 @@ def main():
                 epoch=epoch,
                 metrics={'train': train_metrics, 'val': val_metrics, 'best_val_loss': best_val_loss},
                 checkpoint_dir=checkpoint_dir,
-                is_best=is_best
+                is_best=is_best,
+                hf_api=hf_api,
+                hf_repo_id=args.hf_repo_id,
+                hf_branch=args.hf_branch,
+                keep_local=args.hf_keep_local or not args.hf_repo_id,
+                config_path=config_path,
             )
         
         # Apply early stopping
