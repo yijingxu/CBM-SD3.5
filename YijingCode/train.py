@@ -39,7 +39,7 @@ def _build_intervention_targets(labels):
     return flipped
 
 
-def train_epoch(model, loss_fn, dataloader, optimizer, device, epoch, print_freq=10):
+def train_epoch(model, loss_fn, dataloader, optimizer, device, epoch, print_freq=10, wandb_run=None, base_step=0):
     """Train for one epoch."""
     model.train()
     scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
@@ -92,6 +92,21 @@ def train_epoch(model, loss_fn, dataloader, optimizer, device, epoch, print_freq
         total_adversarial += losses["adversarial"]
         num_batches += 1
 
+        if wandb_run is not None:
+            step_id = base_step + batch_idx + 1
+            wandb_run.log(
+                {
+                    "train_step/loss_total": losses["total"].item(),
+                    "train_step/loss_recon": losses["recon"],
+                    "train_step/loss_recon_text": losses["recon_text"],
+                    "train_step/loss_recon_image": losses["recon_image"],
+                    "train_step/loss_concept": losses["concept"],
+                    "train_step/loss_intervene": losses["intervene"],
+                    "train_step/loss_adversarial": losses["adversarial"],
+                },
+                step=step_id,
+            )
+
         if (batch_idx + 1) % print_freq == 0:
             print(
                 f"  Batch {batch_idx + 1}/{len(dataloader)} | "
@@ -120,7 +135,7 @@ def train_epoch(model, loss_fn, dataloader, optimizer, device, epoch, print_freq
     }
 
 
-def validate(model, loss_fn, dataloader, device):
+def validate(model, loss_fn, dataloader, device, wandb_run=None, base_step=0):
     """Validate the model."""
     model.eval()
 
@@ -133,7 +148,7 @@ def validate(model, loss_fn, dataloader, device):
     num_batches = 0
 
     with torch.no_grad():
-        for batch in dataloader:
+        for batch_idx, batch in enumerate(dataloader):
             text_emb = batch["text_emb"].to(device)
             image_lat = batch["image_lat"].to(device)
             labels = batch["labels"].to(device)
@@ -162,6 +177,20 @@ def validate(model, loss_fn, dataloader, device):
             total_concept += losses["concept"]
             total_intervene += losses["intervene"]
             num_batches += 1
+
+            if wandb_run is not None:
+                step_id = base_step + batch_idx + 1
+                wandb_run.log(
+                    {
+                        "val_step/loss_total": losses["total"].item(),
+                        "val_step/loss_recon": losses["recon"],
+                        "val_step/loss_recon_text": losses["recon_text"],
+                        "val_step/loss_recon_image": losses["recon_image"],
+                        "val_step/loss_concept": losses["concept"],
+                        "val_step/loss_intervene": losses["intervene"],
+                    },
+                    step=step_id,
+                )
 
     return {
         "loss": total_loss / num_batches,
@@ -487,6 +516,8 @@ def main():
     print(f"{'='*60}")
     
     epochs_without_improve = 0
+    global_step = 0
+    global_val_step = 0
     
     for epoch in range(start_epoch, args.epochs):
         print(f"\nEpoch {epoch + 1}/{args.epochs}")
@@ -500,16 +531,22 @@ def main():
             optimizer=optimizer,
             device=device,
             epoch=epoch,
-            print_freq=args.print_freq
+            print_freq=args.print_freq,
+            wandb_run=wandb_run,
+            base_step=global_step
         )
+        global_step += len(train_loader)
         
         # Validate
         val_metrics = validate(
             model=model,
             loss_fn=loss_fn,
             dataloader=val_loader,
-            device=device
+            device=device,
+            wandb_run=wandb_run,
+            base_step=global_val_step
         )
+        global_val_step += len(val_loader)
         
         # Print epoch summary
         print(f"\nEpoch {epoch + 1} Summary:")

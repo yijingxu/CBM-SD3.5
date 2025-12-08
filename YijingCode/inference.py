@@ -464,13 +464,13 @@ def main():
                              'Examples: "YijingCode/checkpoints/training_config.json" (hard bottleneck) or '
                              '"YijingCode/checkpoints_adversarial/training_config.json" (soft bottleneck/adversarial)')
     
-# Concept targets
-parser.add_argument('--concept_a', type=str, default='Smiling',
-                    choices=['Not Smiling', 'Smiling'],
-                    help='Target for concept A (Smile)')
-parser.add_argument('--concept_b', type=str, default='Black Hair',
-                    choices=['Black Hair', 'Blonde Hair'],
-                    help='Target for concept B (Hair Color)')
+    # Concept targets
+    parser.add_argument('--concept_a', type=str, default='Smiling',
+                        choices=['Not Smiling', 'Smiling'],
+                        help='Target for concept A (Smile)')
+    parser.add_argument('--concept_b', type=str, default='Black Hair',
+                        choices=['Black Hair', 'Blonde Hair'],
+                        help='Target for concept B (Hair Color)')
     
     # Intervention parameters
     parser.add_argument('--intervention_start_t', type=int, default=6,
