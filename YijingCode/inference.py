@@ -14,7 +14,12 @@ from PIL import Image
 from diffusers import StableDiffusion3Pipeline
 
 from YijingCode.CBmodel import ConceptBottleneckTransformer
-from apps.env_utils import get_env_var
+try:
+    from apps.env_utils import get_env_var
+except ImportError:
+    import os
+    def get_env_var(key, default=None):
+        return os.environ.get(key, default)
 
 # ==========================================
 # Configuration
