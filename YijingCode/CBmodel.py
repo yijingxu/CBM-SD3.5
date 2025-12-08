@@ -108,9 +108,7 @@ class MMDiTBlock(nn.Module):
 class ConceptBottleneckTransformer(nn.Module):
     """
     Unified CBM with MM-DiT-style AdaLN blocks for both encoder and decoder.
-    Text and image tokens (plus learned concept tokens) flow through encoder blocks.
-    Bottleneck comes from pooled concept tokens. Decoder blocks are conditioned only
-    on the bottleneck (concept) vector and reconstruct text/image tokens.
+    Includes optional down-projection to shrink internal model dim for memory savings.
     """
 
     def __init__(
@@ -119,56 +117,62 @@ class ConceptBottleneckTransformer(nn.Module):
         image_len=2304,
         embed_dim=1536,
         concept_dim=2,
-        num_heads=24,
-        num_encoder_layers=4,
-        num_decoder_layers=4,
-        ff_dim=4096,
-        bottleneck_tokens=4,
+        num_heads=8,
+        num_encoder_layers=2,
+        num_decoder_layers=2,
+        ff_dim=2048,
+        bottleneck_tokens=2,
         dropout=0.1,
         use_adversarial=False,
+        down_proj_dim=512,
     ):
         super().__init__()
         self.text_len = text_len
         self.image_len = image_len
-        self.embed_dim = embed_dim
+        self.input_dim = embed_dim
+        self.model_dim = down_proj_dim or embed_dim
         self.concept_dim = concept_dim
         self.use_adversarial = use_adversarial
 
-        self.unsupervised_dim = 16 if use_adversarial else 0
+        self.unsupervised_dim = 8 if use_adversarial else 0
         self.total_bottleneck = concept_dim + self.unsupervised_dim
         self.num_concept_tokens = bottleneck_tokens
 
+        # Input/output projections to shrink working dimension
+        self.input_proj = nn.Linear(self.input_dim, self.model_dim)
+        self.output_proj = nn.Linear(self.model_dim, self.input_dim)
+
         # Token/type/positional embeddings
-        self.type_embeddings = nn.Parameter(torch.randn(2, embed_dim))  # 0=text, 1=image
-        self.pos_text = nn.Parameter(torch.randn(1, text_len, embed_dim))
-        self.pos_image = nn.Parameter(torch.randn(1, image_len, embed_dim))
-        self.concept_tokens = nn.Parameter(torch.randn(bottleneck_tokens, embed_dim))
+        self.type_embeddings = nn.Parameter(torch.randn(2, self.model_dim))  # 0=text, 1=image
+        self.pos_text = nn.Parameter(torch.randn(1, text_len, self.model_dim))
+        self.pos_image = nn.Parameter(torch.randn(1, image_len, self.model_dim))
+        self.concept_tokens = nn.Parameter(torch.randn(bottleneck_tokens, self.model_dim))
 
         # Reconstruction queries (decoded tokens start here)
-        self.dec_text_queries = nn.Parameter(torch.randn(text_len, embed_dim))
-        self.dec_image_queries = nn.Parameter(torch.randn(image_len, embed_dim))
-        self.memory_pos = nn.Parameter(torch.randn(1, bottleneck_tokens, embed_dim))
+        self.dec_text_queries = nn.Parameter(torch.randn(text_len, self.model_dim))
+        self.dec_image_queries = nn.Parameter(torch.randn(image_len, self.model_dim))
+        self.memory_pos = nn.Parameter(torch.randn(1, bottleneck_tokens, self.model_dim))
 
         # Conditioning projections (use pooled text+image for encoder; bottleneck for decoder)
         self.cond_in = nn.Sequential(
-            nn.Linear(embed_dim * 2, ff_dim),
+            nn.Linear(self.model_dim * 2, ff_dim),
             nn.SiLU(),
-            nn.Linear(ff_dim, embed_dim),
+            nn.Linear(ff_dim, self.model_dim),
         )
         self.cond_from_bottleneck = nn.Sequential(
             nn.Linear(self.total_bottleneck, ff_dim),
             nn.SiLU(),
-            nn.Linear(ff_dim, embed_dim),
+            nn.Linear(ff_dim, self.model_dim),
         )
 
         # Encoder/decoder stacks of MM-DiT blocks
         self.encoder_blocks = nn.ModuleList(
             [
                 MMDiTBlock(
-                    embed_dim=embed_dim,
+                    embed_dim=self.model_dim,
                     num_heads=num_heads,
                     ff_dim=ff_dim,
-                    cond_dim=embed_dim,
+                    cond_dim=self.model_dim,
                     dropout=dropout,
                 )
                 for _ in range(num_encoder_layers)
@@ -178,10 +182,10 @@ class ConceptBottleneckTransformer(nn.Module):
         self.decoder_blocks = nn.ModuleList(
             [
                 MMDiTBlock(
-                    embed_dim=embed_dim,
+                    embed_dim=self.model_dim,
                     num_heads=num_heads,
                     ff_dim=ff_dim,
-                    cond_dim=embed_dim,
+                    cond_dim=self.model_dim,
                     dropout=dropout,
                 )
                 for _ in range(num_decoder_layers)
@@ -189,15 +193,15 @@ class ConceptBottleneckTransformer(nn.Module):
         )
 
         # Bottleneck projections
-        self.bottleneck_proj = nn.Linear(embed_dim, self.total_bottleneck)
-        self.memory_proj = nn.Linear(self.total_bottleneck, bottleneck_tokens * embed_dim)
+        self.bottleneck_proj = nn.Linear(self.model_dim, self.total_bottleneck)
+        self.memory_proj = nn.Linear(self.total_bottleneck, bottleneck_tokens * self.model_dim)
 
         if self.use_adversarial:
             self.grl = GradientReversal(alpha=1.0)
             self.residual_classifier = nn.Sequential(
-                nn.Linear(self.unsupervised_dim, 128),
+                nn.Linear(self.unsupervised_dim, 64),
                 nn.GELU(),
-                nn.Linear(128, concept_dim),
+                nn.Linear(64, concept_dim),
             )
 
         self.apply(_init_transformer)
@@ -214,7 +218,6 @@ class ConceptBottleneckTransformer(nn.Module):
 
     def _run_encoder(self, text_emb, image_lat):
         enc_tokens = self._build_encoder_tokens(text_emb, image_lat)
-        # Conditioning from pooled text/image tokens (global semantic cue)
         pooled_text = text_emb.mean(dim=1)
         pooled_img = image_lat.mean(dim=1)
         cond = self.cond_in(torch.cat([pooled_text, pooled_img], dim=-1))
@@ -233,7 +236,7 @@ class ConceptBottleneckTransformer(nn.Module):
         cond = self.cond_from_bottleneck(bottleneck_vec)
 
         memory = self.memory_proj(bottleneck_vec).view(
-            batch_size, self.num_concept_tokens, self.embed_dim
+            batch_size, self.num_concept_tokens, self.model_dim
         )
         memory = memory + self.memory_pos
 
@@ -262,14 +265,11 @@ class ConceptBottleneckTransformer(nn.Module):
             text_emb: (B, text_len, embed_dim)
             image_lat: (B, image_len, embed_dim)
             force_concept: Optional tensor to override predicted concepts during decoding.
-                           Shape (concept_dim,) or (B, concept_dim)
-        Returns:
-            recon_text, recon_image, concept_logits, adv_logits (or None)
         """
         orig_dtype = text_emb.dtype
 
-        text_emb = text_emb.float()
-        image_lat = image_lat.float()
+        text_emb = self.input_proj(text_emb.float())
+        image_lat = self.input_proj(image_lat.float())
 
         _, bottleneck_vec, concept_logits, residual = self._run_encoder(text_emb, image_lat)
 
@@ -295,16 +295,21 @@ class ConceptBottleneckTransformer(nn.Module):
             bottleneck_for_decode, batch_size=text_emb.shape[0]
         )
 
+        recon_text = self.output_proj(recon_text).to(orig_dtype)
+        recon_image = self.output_proj(recon_image).to(orig_dtype)
+
         return (
-            recon_text.to(orig_dtype),
-            recon_image.to(orig_dtype),
+            recon_text,
+            recon_image,
             concept_logits,
             adv_logits,
         )
 
     def encode_only(self, text_emb, image_lat):
         """Return concept logits (no decode) – used for intervention cycle losses."""
-        _, _, concept_logits, _ = self._run_encoder(text_emb.float(), image_lat.float())
+        text_emb = self.input_proj(text_emb.float())
+        image_lat = self.input_proj(image_lat.float())
+        _, _, concept_logits, _ = self._run_encoder(text_emb, image_lat)
         return concept_logits
 
 

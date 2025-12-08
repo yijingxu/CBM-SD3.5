@@ -42,6 +42,7 @@ def _build_intervention_targets(labels):
 def train_epoch(model, loss_fn, dataloader, optimizer, device, epoch, print_freq=10):
     """Train for one epoch."""
     model.train()
+    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
     total_loss = 0.0
     total_recon = 0.0
@@ -58,26 +59,29 @@ def train_epoch(model, loss_fn, dataloader, optimizer, device, epoch, print_freq
         labels = batch["labels"].to(device)
 
         # Forward pass (original concepts)
-        outputs = model(text_emb, image_lat)
+        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+            outputs = model(text_emb, image_lat)
 
         # Intervention path: force a random concept flip, decode, re-encode to enforce steerability
         intervened_labels = _build_intervention_targets(labels)
-        recon_text_int, recon_image_int, _, _ = model(
-            text_emb, image_lat, force_concept=intervened_labels
-        )
-        concept_logits_int = model.encode_only(recon_text_int.detach(), recon_image_int.detach())
-        intervened = {"concept_logits": concept_logits_int, "target": intervened_labels}
+        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+            recon_text_int, recon_image_int, _, _ = model(
+                text_emb, image_lat, force_concept=intervened_labels
+            )
+            concept_logits_int = model.encode_only(recon_text_int.detach(), recon_image_int.detach())
+            intervened = {"concept_logits": concept_logits_int, "target": intervened_labels}
 
-        losses = loss_fn(
-            outputs=outputs,
-            targets=(text_emb, image_lat),
-            pseudo_labels=labels,
-            intervened=intervened,
-        )
+            losses = loss_fn(
+                outputs=outputs,
+                targets=(text_emb, image_lat),
+                pseudo_labels=labels,
+                intervened=intervened,
+            )
 
         optimizer.zero_grad()
-        losses["total"].backward()
-        optimizer.step()
+        scaler.scale(losses["total"]).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         total_loss += losses["total"].item()
         total_recon += losses["recon"]
@@ -134,21 +138,22 @@ def validate(model, loss_fn, dataloader, device):
             image_lat = batch["image_lat"].to(device)
             labels = batch["labels"].to(device)
 
-            outputs = model(text_emb, image_lat)
+            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                outputs = model(text_emb, image_lat)
 
-            intervened_labels = _build_intervention_targets(labels)
-            recon_text_int, recon_image_int, _, _ = model(
-                text_emb, image_lat, force_concept=intervened_labels
-            )
-            concept_logits_int = model.encode_only(recon_text_int, recon_image_int)
-            intervened = {"concept_logits": concept_logits_int, "target": intervened_labels}
+                intervened_labels = _build_intervention_targets(labels)
+                recon_text_int, recon_image_int, _, _ = model(
+                    text_emb, image_lat, force_concept=intervened_labels
+                )
+                concept_logits_int = model.encode_only(recon_text_int, recon_image_int)
+                intervened = {"concept_logits": concept_logits_int, "target": intervened_labels}
 
-            losses = loss_fn(
-                outputs=outputs,
-                targets=(text_emb, image_lat),
-                pseudo_labels=labels,
-                intervened=intervened,
-            )
+                losses = loss_fn(
+                    outputs=outputs,
+                    targets=(text_emb, image_lat),
+                    pseudo_labels=labels,
+                    intervened=intervened,
+                )
 
             total_loss += losses["total"].item()
             total_recon += losses["recon"]
@@ -259,20 +264,24 @@ def main():
                         help='Embedding dimension (SD3.5 Medium: 1536)')
     parser.add_argument('--concept_dim', type=int, default=2,
                         help='Number of concepts')
-    parser.add_argument('--num_heads', type=int, default=24,
+    parser.add_argument('--num_heads', type=int, default=8,
                         help='Attention heads for transformer encoder/decoder')
-    parser.add_argument('--num_encoder_layers', type=int, default=4,
+    parser.add_argument('--num_encoder_layers', type=int, default=2,
                         help='Transformer encoder layers')
-    parser.add_argument('--num_decoder_layers', type=int, default=4,
+    parser.add_argument('--num_decoder_layers', type=int, default=2,
                         help='Transformer decoder layers')
-    parser.add_argument('--ff_dim', type=int, default=4096,
+    parser.add_argument('--ff_dim', type=int, default=2048,
                         help='Feed-forward width inside transformer blocks')
-    parser.add_argument('--bottleneck_tokens', type=int, default=4,
+    parser.add_argument('--bottleneck_tokens', type=int, default=2,
                         help='Number of learned concept tokens passed through encoder/decoder memory')
     parser.add_argument('--dropout', type=float, default=0.1,
                         help='Dropout used inside transformer blocks')
     parser.add_argument('--use_adversarial', action='store_true',
                         help='Use adversarial training (soft bottleneck)')
+    parser.add_argument('--down_proj_dim', type=int, default=512,
+                        help='Model dimension after input projection (reduces memory).')
+    parser.add_argument('--down_proj_dim', type=int, default=512,
+                        help='Model dimension after input projection (reduces memory).')
     
     # Training arguments
     parser.add_argument('--epochs', type=int, default=100,
@@ -403,6 +412,7 @@ def main():
         bottleneck_tokens=args.bottleneck_tokens,
         dropout=args.dropout,
         use_adversarial=args.use_adversarial,
+        down_proj_dim=args.down_proj_dim,
     ).to(device)
     
     # Count parameters
