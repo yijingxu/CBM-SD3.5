@@ -280,8 +280,6 @@ def main():
                         help='Use adversarial training (soft bottleneck)')
     parser.add_argument('--down_proj_dim', type=int, default=512,
                         help='Model dimension after input projection (reduces memory).')
-    parser.add_argument('--down_proj_dim', type=int, default=512,
-                        help='Model dimension after input projection (reduces memory).')
     
     # Training arguments
     parser.add_argument('--epochs', type=int, default=100,
