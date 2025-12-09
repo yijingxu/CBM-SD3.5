@@ -222,9 +222,65 @@ class CBMInterventionHook:
                         self.intervention_applied = True
                     return tuple(modified_outputs)
                 
-                # Fallback: leave other output types unchanged
-                elif hasattr(out, 'sample') or hasattr(out, 'hidden_states') or isinstance(out, dict):
+                # Handle BaseOutput-style objects (sample/hidden_states)
+                elif hasattr(out, 'sample') or hasattr(out, 'hidden_states'):
+                    # Try to modify sample (image stream) and hidden_states (if present)
+                    if hasattr(out, 'sample'):
+                        sample = out.sample
+                        if isinstance(sample, torch.Tensor) and len(sample.shape) >= 2:
+                            seq_len = sample.shape[1]
+                            if seq_len in (2304, 333):
+                                if sample.shape[0] == 2:
+                                    uncond, cond = sample.chunk(2)
+                                    if seq_len == 2304:
+                                        cond_mod = self.encode_and_force_concept(cond, cond)[1]
+                                        out.sample = torch.cat([uncond, cond_mod], dim=0)
+                                    else:
+                                        cond_mod = self.encode_and_force_concept(cond, cond)[0]
+                                        out.sample = torch.cat([uncond, cond_mod], dim=0)
+                                else:
+                                    if seq_len == 2304:
+                                        out.sample = self.encode_and_force_concept(sample, sample)[1]
+                                    else:
+                                        out.sample = self.encode_and_force_concept(sample, sample)[0]
+                    if hasattr(out, 'hidden_states'):
+                        hs = out.hidden_states
+                        if isinstance(hs, torch.Tensor) and len(hs.shape) >= 2:
+                            seq_len = hs.shape[1]
+                            if seq_len == 333:
+                                if hs.shape[0] == 2:
+                                    uncond, cond = hs.chunk(2)
+                                    cond_mod = self.encode_and_force_concept(cond, cond)[0]
+                                    out.hidden_states = torch.cat([uncond, cond_mod], dim=0)
+                                else:
+                                    out.hidden_states = self.encode_and_force_concept(hs, hs)[0]
+                    if self.intervention_start_t == self.intervention_end_t:
+                        self.intervention_applied = True
                     return out
+
+                # Handle dict output by attempting to modify tensors
+                elif isinstance(out, dict):
+                    modified_out = out.copy()
+                    for key, value in out.items():
+                        if isinstance(value, torch.Tensor) and len(value.shape) >= 2:
+                            seq_len = value.shape[1]
+                            if seq_len == 333:
+                                if value.shape[0] == 2:
+                                    uncond, cond = value.chunk(2)
+                                    cond_mod = self.encode_and_force_concept(cond, cond)[0]
+                                    modified_out[key] = torch.cat([uncond, cond_mod], dim=0)
+                                else:
+                                    modified_out[key] = self.encode_and_force_concept(value, value)[0]
+                            elif seq_len == 2304:
+                                if value.shape[0] == 2:
+                                    uncond, cond = value.chunk(2)
+                                    cond_mod = self.encode_and_force_concept(cond, cond)[1]
+                                    modified_out[key] = torch.cat([uncond, cond_mod], dim=0)
+                                else:
+                                    modified_out[key] = self.encode_and_force_concept(value, value)[1]
+                    if self.intervention_start_t == self.intervention_end_t:
+                        self.intervention_applied = True
+                    return modified_out
                 
             except Exception as e:
                 # If intervention fails, log error but don't crash
