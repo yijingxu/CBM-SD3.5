@@ -1,0 +1,46 @@
+dataset:
+  name: celebahq
+  transforms_1: [0.5]
+  transforms_2: [0.5]
+  img_size: 256
+  batch_size: 4  # Reduced to avoid OOM with large emb_size=128
+  test_batch_size: 4
+  num_channels: 3
+  data_path: /data/jmu27/posthoc-generative-cbm/datasets/CelebA-HQ
+  num_workers: 4
+  use_real_labels: true  # Use real labels from full training set
+  train_anno: /data/jmu27/posthoc-generative-cbm/datasets/CelebA-HQ/train_balanced.txt
+  test_anno: /data/jmu27/posthoc-generative-cbm/datasets/CelebA-HQ/test_balanced.txt
+
+model:
+  pretrained: google/ddpm-celebahq-256
+  type: cbae_ddpm
+  latent_shape: [512, 8, 8]
+  latent_noise_dim: 512
+  input_latent_dim: 32768  # 512 × 8 × 8 = 32768
+  max_timestep: 400  # Apply CB-AE for t <= 400 (early timesteps)
+  has_concepts: True
+  concepts:
+      concept_bins: [2, 2, 2, 2, 2, 2, 2, 2]  # 8 binary concepts
+      concept_names: ["attractive", "lipstick", "mouth-closed", "smiling", "cheekbones", "makeup", "gender", "eyebrows"]
+      emb_size: 128  # Large embedding size for better representation with 8 concepts
+      concept_output: [2, 2, 2, 2, 2, 2, 2, 2]  # All binary classification
+      types: ["bin", "bin", "bin", "bin", "bin", "bin", "bin", "bin"]  # All binary
+
+train_config:
+  epochs: 50  # Train for 50 epochs on full dataset
+  recon_lr: 0.0002
+  conc_lr: 0.0002
+  betas: [0.5, 0.99]
+  save_model: True
+  use_cuda: True
+  log_interval: 100  # Log every 100 steps
+  steps_per_epoch: 1193  # 4775 images / 4 batch = ~1193 steps per epoch
+  pl_prob_thresh: 0  # Not using pseudo-label threshold since we have real labels
+  plot_loss: True
+
+evaluation:
+  generation: True
+  save_images: True
+  save_concept_image: True
+  save_results: True
