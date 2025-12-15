@@ -1,9 +1,3 @@
----
-editor_options:
-  markdown:
-    wrap: 72
----
-
 # DDPM + Concept Bottleneck Autoencoder (CB-AE)
 
 This repository contains code to train a **Concept Bottleneck
