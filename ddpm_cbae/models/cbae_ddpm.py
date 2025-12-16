@@ -240,6 +240,8 @@ class CBAE_DDPM(nn.Module):
                     "recon_mid": recon_mid,
                     "concept_logits": c_logits,
                     "eps_orig": eps_orig,
+                    "emb": emb,
+                    "down_res": down_res,
                 }
         else:
             # Standard DDPM UNet forward (no CB-AE)
@@ -261,6 +263,9 @@ class CBAE_DDPM(nn.Module):
         DDPM adaptation: preserve frozen generator output by matching epsilon predictions.
         """
         return F.mse_loss(eps_cbae, eps_orig)
+
+    def loss_Li2(self, c_prime_intervened: torch.Tensor, y_hat_intervened: torch.Tensor) -> torch.Tensor:
+        return self.loss_Lc(c_prime_intervened, y_hat_intervened)
 
     def loss_Lc(self, concept_logits: torch.Tensor, y_hat: torch.Tensor) -> torch.Tensor:
         """
@@ -317,7 +322,7 @@ class CBAE_DDPM(nn.Module):
         c_int = intervene_logits(c, spec, concept_to_intervene, target_class=target_class)
         w_int = self.cbae.dec(c_int)
         c_prime_int = self.cbae.enc(w_int)
-
+        '''
         # y_hat_intervened (paper) is y_hat modified at the intervened concept index
         y_hat_int = y_hat.clone()
         if spec.types[concept_to_intervene] == "bin":
@@ -327,6 +332,25 @@ class CBAE_DDPM(nn.Module):
             # if categorical and target_class provided, set it; else leave as-is
             if target_class is not None:
                 y_hat_int[:, concept_to_intervene] = int(target_class)
+        '''
+        y_hat_int = y_hat.clone()
+        
+        if spec.types[concept_to_intervene] == "bin":
+            if target_class is not None:
+                # FORCE target class (e.g., smiling = 1)
+                y_hat_int[:, concept_to_intervene] = int(target_class)
+            else:
+                # default: flip 0 <-> 1
+                y_hat_int[:, concept_to_intervene] = 1 - y_hat_int[:, concept_to_intervene]
+        else:
+            # categorical concepts
+            if target_class is not None:
+                y_hat_int[:, concept_to_intervene] = int(target_class)
+
+        if getattr(self, "debug_intervene", False):
+            print("[Intervene] k =", concept_to_intervene,
+                  "| target =", target_class,
+                  "| unique y_hat_int =", torch.unique(y_hat_int[:, concept_to_intervene]))
 
         return {
             "concept_idx": torch.tensor([concept_to_intervene], device=mid.device),
@@ -335,6 +359,7 @@ class CBAE_DDPM(nn.Module):
             "w_intervened": w_int,
             "c_prime_intervened": c_prime_int,
             "y_hat_intervened": y_hat_int,
+            "concept_to_intervene": concept_to_intervene,
         }
 
 
@@ -378,6 +403,16 @@ class DDPMNoiseSchedulerHelper:
             s1 = s1.unsqueeze(-1)
             s2 = s2.unsqueeze(-1)
         return s1 * x_0 + s2 * noise
+    
+    def predict_x0(self, x_t: torch.Tensor, eps: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        device = x_t.device
+        s1 = self.sqrt_alphas_cumprod[t].to(device)
+        s2 = self.sqrt_one_minus_alphas_cumprod[t].to(device)
+        while s1.ndim < x_t.ndim:
+            s1 = s1.unsqueeze(-1)
+            s2 = s2.unsqueeze(-1)
+        # x_t = s1*x0 + s2*eps  =>  x0 = (x_t - s2*eps)/s1
+        return (x_t - s2 * eps) / (s1 + 1e-8)
 
     def to(self, device: torch.device):
         self.betas = self.betas.to(device)

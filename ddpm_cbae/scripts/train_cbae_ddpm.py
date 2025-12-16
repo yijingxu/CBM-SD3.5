@@ -23,7 +23,6 @@ from datasets import load_dataset
 
 from huggingface_hub import HfApi, hf_hub_download
 
-
 # -------------------------
 # Utils
 # -------------------------
@@ -119,10 +118,23 @@ def main():
     parser.add_argument("--w_lr2", type=float, default=1.0)
     parser.add_argument("--w_lc", type=float, default=1.0)
 
+    # Intervention loss weights
+    parser.add_argument("--w_li1", type=float, default=0.0)
+    parser.add_argument("--w_li2", type=float, default=0.0)
+    
+    # How often to apply intervention per batch
+    parser.add_argument("--p_intervene", type=float, default=0.5)
+    
+    # Optional: intervene a fixed concept index (-1 means random)
+    parser.add_argument("--intervene_idx", type=int, default=-1)
+    parser.add_argument("--intervene_target", type=int, default=-1,
+                    help="If >=0, force intervened concept to this class (0/1). If -1, use default flip logic.")
+
     # Resume (optional)
     parser.add_argument("--resume_from_hf", action="store_true",
                         help="If set, tries to resume CB-AE weights from HF checkpoint.")
     args = parser.parse_args()
+    pseudo = None
 
     set_seed(args.seed)
 
@@ -134,9 +146,28 @@ def main():
     # IMPORTANT: this expects your updated code lives here:
     #   /content/posthoc-generative-cbm/models/cbae_ddpm.py
     from models.cbae_ddpm import CBAE_DDPM, ConceptSpec, DDPMNoiseSchedulerHelper
+    from models.clip_pseudolabeler import CLIP_PseudoLabeler
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Using device:", device)
+
+    pseudo = None
+    if args.w_li1 > 0:
+        set_of_classes = [
+            ["not smiling", "smiling"],              # Smiling
+            ["not young", "young"],                  # Young
+            ["female", "male"],                      # Male
+            ["no eyeglasses", "wearing eyeglasses"], # Eyeglasses
+        ]
+        pseudo = CLIP_PseudoLabeler(
+            set_of_classes=set_of_classes,
+            device=device,
+            clip_model_name="ViT-B/16",
+            clip_model_type="clip",
+        ).eval()
+        for p in pseudo.parameters():
+            p.requires_grad = False
+        print("[CLIP] Pseudo-labeler ready.")
 
     # ---- Concepts (fixed to your 4-concept run) ----
     selected_concepts = ["Smiling", "Young", "Male", "Eyeglasses"]
@@ -205,7 +236,7 @@ def main():
 
     # ---- Training loop (Step 8 logic) ----
     model.train()
-    running = {"lr1": 0.0, "lr2": 0.0, "lc": 0.0, "total": 0.0}
+    running = {"lr1": 0.0, "lr2": 0.0, "lc": 0.0, "li1": 0.0, "li2": 0.0, "total": 0.0}
     t0 = time.time()
 
     it = iter(train_loader)
@@ -218,6 +249,7 @@ def main():
     api = HfApi() if args.upload_to_hf else None
 
     print("[Train] Starting...")
+
     for step in range(global_step + 1, args.total_steps + 1):
         try:
             x0, y01 = next(it)
@@ -241,15 +273,99 @@ def main():
         loss_lr2 = model.loss_Lr2_proxy(comps["eps_orig"], eps_pred)
         loss_lc = model.loss_Lc(comps["concept_logits"], y01)
 
-        loss = args.w_lr1 * loss_lr1 + args.w_lr2 * loss_lr2 + args.w_lc * loss_lc
+        loss_li1 = torch.tensor(0.0, device=device)
+        loss_li2 = torch.tensor(0.0, device=device)
+        
+        do_intervene = (torch.rand(()) < args.p_intervene) and (args.w_li1 > 0 or args.w_li2 > 0)
+        
+        if do_intervene:
+            concept_idx = None if args.intervene_idx < 0 else args.intervene_idx
+            target_class = None if args.intervene_target < 0 else int(args.intervene_target)
+
+            ints = model.intervention_step(
+                mid=comps["mid"],          # from return_components
+                y_hat=y01,                 # your GT concept labels
+                concept_to_intervene=concept_idx,
+                target_class=target_class, # keeps your default flip logic
+            )
+        
+            # 1) compute eps for intervened latent at same t
+            eps_int = model.ddpm_eps_from_mid(
+                mid=ints["w_intervened"],
+                emb=comps["emb"],
+                down_res=comps["down_res"],
+            )
+        
+            # 2) convert to x0 prediction (image-like)
+            x0_int = scheduler.predict_x0(x_t, eps_int, t).clamp(-1, 1)
+        
+            # 3) CLIP pseudo-label logits (list of [B,2])
+            # Li1 uses external scorer M(x) (CLIP). Only run if w_li1 > 0.
+            if args.w_li1 > 0:
+                assert pseudo is not None, "pseudo-labeler not initialized (pseudo is None)"
+                with torch.no_grad():
+                    logits_list = pseudo.get_soft_pseudo_labels(x0_int)
+                m_logits = torch.cat(logits_list, dim=-1)
+                loss_li1 = model.loss_Lc(m_logits, ints["y_hat_intervened"])
+            else:
+                loss_li1 = torch.tensor(0.0, device=device)
+                        
+            # Li2: enforce encoder-consistency matches intervened target
+            loss_li2 = model.loss_Lc(ints["c_prime_intervened"], ints["y_hat_intervened"])
+            
+            if args.w_li1 > 0 and (step % args.log_every == 0):
+                assert pseudo is not None
+                k = ints["concept_to_intervene"]
+            
+                # x0 from original eps (no intervention)
+                x0_orig = scheduler.predict_x0(x_t, comps["eps_orig"], t).clamp(-1, 1)
+            
+                with torch.no_grad():
+                    m_logits_o = torch.cat(pseudo.get_soft_pseudo_labels(x0_orig), dim=-1)
+                    m_logits_i = torch.cat(pseudo.get_soft_pseudo_labels(x0_int),  dim=-1)
+            
+                def pred_k(m_logits_concat, k):
+                    start = 2 * k
+                    return m_logits_concat[:, start:start+2].argmax(dim=-1)
+            
+                pred_before = pred_k(m_logits_o, k)
+                pred_after  = pred_k(m_logits_i, k)
+
+                flip_rate = (pred_before != pred_after).float().mean().item()
+                #print(f"[Dbg] intervene k={k} | CLIP flip-rate@k={flip_rate:.3f}")
+                b0 = (pred_before == 0).sum().item()
+                b1 = (pred_before == 1).sum().item()
+                a0 = (pred_after  == 0).sum().item()
+                a1 = (pred_after  == 1).sum().item()
+                
+                # NEW: success rate for "force smiling"
+                succ = (pred_after == 1).float().mean().item()
+            
+                print(
+                    f"[Dbg] k={k} | P(after=1)={succ:.3f} | "
+                    f"before (0,1)=({b0},{b1}) -> after (0,1)=({a0},{a1}) | "
+                    f"flip={flip_rate:.3f}"
+                )
+
+        # loss = args.w_lr1 * loss_lr1 + args.w_lr2 * loss_lr2 + args.w_lc * loss_lc
+        loss = (
+            args.w_lr1 * loss_lr1
+          + args.w_lr2 * loss_lr2
+          + args.w_lc  * loss_lc
+          + args.w_li1 * loss_li1
+          + args.w_li2 * loss_li2
+        )
+
         loss.backward()
         optimizer.step()
 
         running["lr1"] += loss_lr1.item()
         running["lr2"] += loss_lr2.item()
         running["lc"] += loss_lc.item()
+        running['li1'] += loss_li1.item()
+        running['li2'] += loss_li2.item()
         running["total"] += loss.item()
-
+        '''
         if step % args.log_every == 0:
             dt = time.time() - t0
             print(
@@ -262,6 +378,22 @@ def main():
             for k in running:
                 running[k] = 0.0
             t0 = time.time()
+        '''
+        if step % args.log_every == 0:
+            dt = time.time() - t0
+            print(
+                f"[Step {step}] loss={running['total']/args.log_every:.4f} | "
+                f"lr1={running['lr1']/args.log_every:.4f} | "
+                f"lr2={running['lr2']/args.log_every:.4f} | "
+                f"lc={running['lc']/args.log_every:.4f} | "
+                f"li1={running['li1']/args.log_every:.4f} | "
+                f"li2={running['li2']/args.log_every:.4f} | "
+                f"{dt:.1f}s"
+            )
+            for k in running:
+                running[k] = 0.0
+            t0 = time.time()
+
 
         if step % args.save_every == 0:
             ckpt = {
@@ -283,6 +415,12 @@ def main():
                     repo_type="model",
                 )
                 print(f"[HF] Uploaded checkpoint: {args.hf_repo_id}/{args.hf_ckpt_path} (step={step})")
+
+    # Always save final checkpoint
+    os.makedirs("checkpoints", exist_ok=True)
+    ckpt_path = f"checkpoints/cbae_ddpm_final.pt"
+    torch.save(model.state_dict(), ckpt_path)
+    print(f"[CKPT] Saved final checkpoint to {ckpt_path}")
 
     print("[Train] Done.")
 
