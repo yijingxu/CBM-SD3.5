@@ -217,6 +217,12 @@ class SD15WithCBAE(nn.Module):
             model_id, subfolder="scheduler"
         )
         
+        # Move SD components to device BEFORE creating null embedding
+        # This fixes the device mismatch error
+        self.vae = self.vae.to(device)
+        self.unet = self.unet.to(device)
+        self.text_encoder = self.text_encoder.to(device)
+        
         # Get null text embedding for unconditional generation
         self._setup_null_embedding()
         
@@ -231,6 +237,9 @@ class SD15WithCBAE(nn.Module):
             hidden_dim=hidden_dim,
             num_layers=num_layers,
         )
+        
+        # Move CB-AE to device
+        self.cbae = self.cbae.to(device)
         
         # Store concept dimensions for loss computation
         self.concept_dims = concept_dims if concept_dims else [2] * n_concepts
