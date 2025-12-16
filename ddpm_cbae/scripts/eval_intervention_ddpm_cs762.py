@@ -50,12 +50,12 @@ def get_c_logits_from_components(comps: dict) -> torch.Tensor:
     Try common keys from your codepath.
     We need the concatenated concept logits [B, sum(spec.sizes)].
     """
-    for key in ["c_prime", "c_logits", "c_hat_logits", "concept_logits", "c"]:
+    for key in ["concept_logits", "c_prime", "c_logits", "c_hat_logits", "c"]:
         if key in comps and isinstance(comps[key], torch.Tensor):
             return comps[key]
     raise KeyError(
-        "Could not find concept logits in return_components(). "
-        "Expected one of: c_prime, c_logits, c_hat_logits, concept_logits, c."
+        "Could not find concept logits in components. "
+        f"Available keys: {list(comps.keys())}"
     )
 
 
@@ -119,7 +119,7 @@ def main():
         model.debug_intervene = False
 
     # 2) CLIP pseudo-labeler for evaluation only
-    pseudo = CLIP_PseudoLabeler(device=device)
+    pseudo = CLIP_PseudoLabeler(set_of_classes=selected_concepts, device=device)
     print("[Eval] CLIP pseudo-labeler ready.")
 
     # 3) DDIM scheduler (paper-style)
@@ -147,28 +147,31 @@ def main():
         for t in scheduler.timesteps:
             t_int = int(t.item())
 
-            # ORIGINAL PATH
-            comps_o = model.return_components(x, t)
-            x = scheduler.step(comps_o["eps_orig"], t, x).prev_sample
+            # ORIGINAL PATH - use forward() with return_components=True
+            eps_o, comps_o = model.forward(x, t, use_cbae=True, return_components=True)
+            
+            if comps_o is not None:
+                x = scheduler.step(comps_o["eps_orig"], t, x).prev_sample
+            else:
+                x = scheduler.step(eps_o, t, x).prev_sample
 
             # INTERVENTION PATH
-            comps = model.return_components(x_int, t)
+            eps_pred, comps = model.forward(x_int, t, use_cbae=True, return_components=True)
 
-            # Only intervene when noise level is below threshold (t <= max_timestep),
-            # mimicking the paper’s “skip very early / very noisy steps”.
-            if t_int > args.max_timestep:
-                x_int = scheduler.step(comps["eps_orig"], t, x_int).prev_sample
+            # Only intervene when noise level is below threshold (t <= max_timestep)
+            if t_int > args.max_timestep or comps is None:
+                x_int = scheduler.step(eps_pred, t, x_int).prev_sample
                 continue
 
-            # Build y_hat from the model's own concept logits at this step.
-            c_logits = get_c_logits_from_components(comps)     # [B, sum(sizes)]
+            # Build y_hat from the model's concept logits
+            c_logits = get_c_logits_from_components(comps)  # [B, sum(sizes)]
             y_hat = hard_concepts_from_logits(c_logits, spec)  # [B, num_concepts]
 
             ints = model.intervention_step(
                 mid=comps["mid"],
                 y_hat=y_hat,
                 concept_to_intervene=args.concept_idx,
-                target_class=args.target,   # force target
+                target_class=args.target,
             )
 
             eps_int = model.ddpm_eps_from_mid(
