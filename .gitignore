@@ -30,7 +30,7 @@ dist/
 *.pth
 *.onnx
 checkpoints/
-models/
+/models/
 weights/
 huggingface/
 ~/.cache/
@@ -53,3 +53,10 @@ config.yaml
 *.key
 *.pem
 posthoc-generative-cbm/
+
+# Ignore ONLY the repo-root models directory (not nested ones)
+/models/
+
+# But always include ddpm_cbae models
+!ddpm_cbae/models/
+!ddpm_cbae/models/**

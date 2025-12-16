@@ -1,0 +1,19 @@
+# checkpoints / weights
+*.pt
+checkpoints*/
+checkpoints_local/
+
+# caches
+.cache/
+**/.cache/
+huggingface/
+**/huggingface/
+
+# python
+__pycache__/
+*.pyc
+
+# OS/editor
+.DS_Store
+.vscode/
+.ipynb_checkpoints/
