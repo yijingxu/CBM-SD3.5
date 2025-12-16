@@ -31,8 +31,8 @@ import yaml
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from models.cbae_sd15 import SD15WithCBAE, get_concept_index
-from models.pseudo_labeler import CLIP_PseudoLabeler
+from cbae_sd15 import SD15WithCBAE, get_concept_index
+from pseudo_labeler import CLIP_PseudoLabeler
 
 import wandb
 
