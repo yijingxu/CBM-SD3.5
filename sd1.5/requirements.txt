@@ -1,0 +1,25 @@
+# Requirements for CB-AE SD1.5 training
+
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Diffusion models
+diffusers>=0.25.0
+transformers>=4.30.0
+accelerate>=0.20.0
+
+# CLIP for pseudo-labeling
+git+https://github.com/openai/CLIP.git
+
+# Logging
+wandb>=0.15.0
+
+# Data processing
+pandas>=1.5.0
+Pillow>=9.0.0
+
+# Utilities
+tqdm>=4.64.0
+pyyaml>=6.0
+numpy>=1.23.0

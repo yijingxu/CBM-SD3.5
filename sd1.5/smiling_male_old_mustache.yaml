@@ -1,0 +1,47 @@
+# Configuration for training CB-AE on Smiling, Male, Old, Mustache attributes
+# Usage: python train_synthetic.py --config configs/smiling_male_old_mustache.yaml
+
+# Model settings
+sd_model: "runwayml/stable-diffusion-v1-5"
+img_size: 512
+hidden_dim: 1024
+num_layers: 4
+unsupervised_dim: 64
+max_timestep: 400
+
+# Attributes to predict
+attributes:
+  - Smiling
+  - Male
+  - Old
+  - Mustache
+
+# Training settings
+epochs: 50
+batch_size: 4
+steps_per_epoch: 500
+lr: 0.0001
+lr_interv: 0.0001
+
+# Generation settings
+num_inference_steps: 20
+guidance_scale: 7.5
+underspecified_ratio: 0.3
+negative_prompt: null  # Set to "blurry, low quality, distorted" if needed
+
+# Logging settings
+wandb_project: "cbae-sd15"
+wandb_name: "smiling-male-old-mustache"
+log_interval: 20
+eval_interval: 1
+save_interval: 5
+log_images: true
+log_images_interval: 100
+
+# Checkpointing
+checkpoint_dir: "checkpoints/smiling_male_old_mustache"
+
+# Other settings
+device: "cuda"
+seed: 42
+mixed_precision: false
