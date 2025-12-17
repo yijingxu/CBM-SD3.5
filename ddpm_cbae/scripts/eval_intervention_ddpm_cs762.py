@@ -59,6 +59,60 @@ def get_c_logits_from_components(comps: dict) -> torch.Tensor:
     )
 
 
+def load_checkpoint(model: CBAE_DDPM, ckpt_path: str):
+    """
+    Load checkpoint - handles multiple formats:
+    1. Dictionary with 'cbae_state' key (training checkpoint format)
+    2. Full model state dict (with unet.* and cbae.* keys)
+    3. Just CB-AE state dict (encoder.* / decoder.* keys directly)
+    4. Partial state dict with only cbae.* keys (from model.state_dict() but missing unet)
+    """
+    print(f"[Checkpoint] Loading from: {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    
+    if isinstance(ckpt, dict):
+        # Format 1: Training checkpoint with metadata (cbae_ddpm_stepXXXX.pt style)
+        if "cbae_state" in ckpt:
+            model.cbae.load_state_dict(ckpt["cbae_state"], strict=True)
+            print(f"[Checkpoint] Loaded CB-AE from 'cbae_state' key")
+            print(f"[Checkpoint]   global_step: {ckpt.get('global_step', 'N/A')}")
+            print(f"[Checkpoint]   max_timestep: {ckpt.get('max_timestep', 'N/A')}")
+            print(f"[Checkpoint]   loss_weights: {ckpt.get('loss_weights', 'N/A')}")
+        
+        # Format 2: Full model state dict with both unet.* and cbae.* keys
+        elif any(k.startswith("unet.") for k in ckpt.keys()) and any(k.startswith("cbae.") for k in ckpt.keys()):
+            model.load_state_dict(ckpt, strict=True)
+            print(f"[Checkpoint] Loaded full model state dict (unet + cbae)")
+        
+        # Format 3: Just CB-AE state dict (encoder.* / decoder.* keys directly)
+        elif any(k.startswith("encoder.") or k.startswith("decoder.") for k in ckpt.keys()):
+            model.cbae.load_state_dict(ckpt, strict=True)
+            print(f"[Checkpoint] Loaded CB-AE state dict directly")
+        
+        # Format 4: cbae_ddpm_final.pt style - has cbae.* keys but NO unet.* keys
+        elif any(k.startswith("cbae.") for k in ckpt.keys()):
+            # Extract only cbae.* keys and strip the "cbae." prefix
+            cbae_state = {}
+            for k, v in ckpt.items():
+                if k.startswith("cbae."):
+                    new_key = k[len("cbae."):]  # Remove "cbae." prefix
+                    cbae_state[new_key] = v
+            
+            model.cbae.load_state_dict(cbae_state, strict=True)
+            print(f"[Checkpoint] Loaded CB-AE from partial model state dict (cbae.* keys)")
+        
+        else:
+            available_keys = list(ckpt.keys())[:15]
+            raise ValueError(
+                f"Unknown checkpoint format.\n"
+                f"Available keys ({len(ckpt)} total): {available_keys}..."
+            )
+    else:
+        raise ValueError(f"Checkpoint is not a dict, got {type(ckpt)}")
+    
+    return model
+
+
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser()
@@ -110,8 +164,8 @@ def main():
         freeze_unet=True,
     ).to(device)
 
-    ckpt = torch.load(args.ckpt, map_location="cpu")
-    model.load_state_dict(ckpt, strict=True)
+    # Load checkpoint (handles multiple formats)
+    model = load_checkpoint(model, args.ckpt)
     model.eval()
 
     # Optional: silence intervention debug prints if present
