@@ -1,3 +1,7 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch
+torchvision
+torchaudio
 ftfy
 regex
 matplotlib
@@ -11,6 +15,6 @@ diffusers
 accelerate
 gdown
 clean-fid
-torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 git+https://github.com/openai/CLIP.git
-huggingface_hub accelerate datasets
+huggingface_hub
+datasets
